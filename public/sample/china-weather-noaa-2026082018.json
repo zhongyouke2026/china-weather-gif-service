@@ -1,0 +1,27 @@
+{
+  "assetKey": "china-7d",
+  "gfsRun": "2026082018",
+  "storagePath": "china-7d/2026082018/china-weather-2026082018-dc493f8bd9ec.gif",
+  "sha256": "dc493f8bd9ecd05b42f152b2ac7ba85172e969988cbd887172f03010d3be525c",
+  "byteSize": 6666998,
+  "frameCount": 57,
+  "forecastStart": "2026-08-20T18:00:00+00:00",
+  "forecastEnd": "2026-08-27T18:00:00+00:00",
+  "generatedAt": "2026-08-21T06:43:34.280009+00:00",
+  "metadata": {
+    "pipelineVersion": "1.0.0",
+    "bounds": {
+      "leftLon": 72.0,
+      "rightLon": 136.0,
+      "bottomLat": 17.0,
+      "topLat": 55.0
+    },
+    "forecastStepHours": 3,
+    "activeTyphoons": [],
+    "qweatherCityCount": 0,
+    "attribution": [
+      "Weather model: NOAA/NCEP GFS",
+      "Weather & Typhoon data: QWeather"
+    ]
+  }
+}

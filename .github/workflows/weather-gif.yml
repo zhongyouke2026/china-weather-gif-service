@@ -1,0 +1,75 @@
+name: Generate China weather GIF
+
+on:
+  schedule:
+    # GFS runs at 00/06/12/18 UTC. These times leave publication headroom.
+    - cron: "35 5,11,17,23 * * *"
+  workflow_dispatch:
+    inputs:
+      gfs_run:
+        description: "GFS run (YYYYMMDDHH) or auto"
+        required: false
+        default: "auto"
+  repository_dispatch:
+    types: [weather-gfs-ready]
+
+concurrency:
+  group: china-weather-gif
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      REQUESTED_GFS_RUN: ${{ github.event.client_payload.gfs_run || inputs.gfs_run || 'auto' }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      QWEATHER_API_HOST: ${{ secrets.QWEATHER_API_HOST }}
+      QWEATHER_API_KEY: ${{ secrets.QWEATHER_API_KEY }}
+      WEATHER_STORAGE_BUCKET: weather-assets
+      WEATHER_ASSET_KEY: china-7d
+      WEATHER_WORK_DIR: work
+      WEATHER_OUTPUT_DIR: artifacts
+      WEATHER_DOWNLOAD_WORKERS: "3"
+      CARTOPY_DATA_DIR: ${{ github.workspace }}/work/cartopy
+      MPLCONFIGDIR: ${{ github.workspace }}/work/matplotlib
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install native fonts and ecCodes tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk libeccodes-tools
+
+      - name: Cache Natural Earth basemap
+        uses: actions/cache@v4
+        with:
+          path: work/cartopy
+          key: cartopy-natural-earth-110m-v1
+
+      - name: Install pipeline
+        run: python -m pip install --upgrade pip && python -m pip install .
+
+      - name: Generate and publish
+        run: python -m weather_pipeline generate --gfs-run "$REQUESTED_GFS_RUN"
+
+      - name: Keep a short-lived build artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: china-weather-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 7

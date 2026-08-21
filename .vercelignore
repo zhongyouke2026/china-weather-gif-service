@@ -1,0 +1,12 @@
+# These files are required by GitHub Actions/local verification, not by the
+# lightweight Next.js deployment.
+weather_pipeline/
+tests/
+supabase/
+docs/
+pyproject.toml
+public/sample/
+work/
+artifacts/
+.venv/
+
