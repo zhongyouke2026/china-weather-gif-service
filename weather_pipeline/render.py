@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -28,8 +29,9 @@ from cartopy.io import shapereader
 from matplotlib import font_manager
 from matplotlib.lines import Line2D
 from matplotlib.offsetbox import AnnotationBbox, DrawingArea
-from matplotlib.patches import Arc, Circle, Ellipse, FancyBboxPatch, Polygon
+from matplotlib.patches import Arc, Circle, Ellipse, FancyBboxPatch, Polygon, Rectangle
 from matplotlib.text import Text
+from matplotlib.transforms import IdentityTransform
 from PIL import Image
 
 from .models import CityWeather, FrameData, ModelTrackPoint, StormPoint, Typhoon
@@ -43,49 +45,115 @@ cartopy.config["data_dir"] = str(_cartopy_data_dir)
 
 LOGGER = logging.getLogger(__name__)
 
-# A restrained, consumer-friendly palette inspired by Korean fintech products.
-INK = "#191F28"
-MUTED = "#8B95A1"
-SUBTLE = "#B0B8C1"
-BACKGROUND = "#F7F8FA"
+
+# ---------------------------------------------------------------------------
+# Design system
+#
+# Every visible value in this module comes from one of the four scales below —
+# color, type, space, radius. Nothing is tuned per component. The rules:
+#
+#   1. One accent color. Blue means "data we measured"; red/amber means "storm".
+#      Everything else is a neutral gray so the weather is the only thing that
+#      carries color.
+#   2. Six type sizes, two weights. No in-between sizes.
+#   3. All layout is expressed in pixels on a 1000x625 reference canvas and
+#      snapped to a 4px grid, then scaled to whatever the real canvas is.
+#      Chrome is drawn in display space so corner radii stay circular instead
+#      of being stretched by the 1.6:1 canvas aspect ratio.
+#   4. One surface style: near-opaque white, one hairline, one soft shadow.
+# ---------------------------------------------------------------------------
+
+# -- Color -------------------------------------------------------------------
+LABEL = "#1D1D1F"           # primary text
+LABEL_SECONDARY = "#565B62"  # supporting values
+LABEL_TERTIARY = "#8B9199"   # captions, units, attribution
+
+ACCENT = "#0071E3"
+ACCENT_DEEP = "#0A4FA8"
+ALERT = "#FF3B30"
+WARM = "#FF9500"
+COOL = "#3E9BE9"
+TAIWAN = "#7D7BC4"
+
+OCEAN = "#E6ECF2"            # canvas ground
+LAND = "#F0F2F5"             # land outside the subject country
+LAND_SUBJECT = "#FCFDFE"     # China and Taiwan read brighter than everything else
+COASTLINE = "#CAD2DA"
+BORDERLINE = "#D6DBE1"
+SUBJECT_LINE = "#6FA0DE"
+
 SURFACE = "#FFFFFF"
-LAND = "#F2F4F6"
-OCEAN = "#EAF5F9"
-PRIMARY = "#3182F6"
-PRIMARY_DARK = "#1B64DA"
-TYPHOON = "#F04452"
-WARM = "#F76A35"
-TAIWAN = "#6B5CF6"
+CARD_FILL = "#FFFFFFF2"
+# City capsules sit directly on coastlines and rain, where a 95% fill lets the
+# line underneath show through the text. They get a near-opaque fill instead.
+CAPSULE_FILL = "#FFFFFFFC"
+CARD_FILL_TINT = "#F4F9FFF2"
+CARD_HAIRLINE = "#CFD6DE"
+CARD_SHADOW = "#2A3644"
+SEPARATOR = "#DDE2E8"
 
-# Storm identity is encoded redundantly with both color and a visible number.
-# The number is repeated in the fixed west-side panel and in the storm eye, so
-# no leader line is needed even when two tracks cross the crowded east coast.
-STORM_COLORS = (TYPHOON, "#FF8A3D", "#00A6A6")
+# Storm identity is encoded redundantly with color and a visible number, so a
+# crossing track is still readable when two storms share the same coastline.
+STORM_COLORS = (ALERT, "#FF9F0A", "#30B0C7")
 
-# One material system for every floating surface.  Animated GIFs cannot use a
-# live backdrop blur, so the renderer recreates the useful parts of a frosted
-# material with restrained translucency, a cool hairline, a white specular
-# edge and one consistent soft shadow.  The more opaque surface is used for
-# weather data cards, while the blue-tinted variant is reserved for time.
-GLASS_SURFACE = "#F8FBFFE8"
-GLASS_SURFACE_STRONG = "#FBFDFFF2"
-GLASS_SURFACE_BLUE = "#EDF6FFE8"
-GLASS_EDGE = "#FFFFFFEE"
-GLASS_HAIRLINE = "#B8C7D6A8"
-GLASS_SEPARATOR = "#AFC2D480"
-GLASS_HIGHLIGHT = "#FFFFFFE8"
-GLASS_SHADOW = "#455568"
-GLASS_CONNECTOR = "#718397"
+ICON_CLOUD = "#AEB7C2"
+ICON_SUN = "#FFB320"
+ICON_RAIN = COOL
+
+# -- Type (points at 100 dpi) ------------------------------------------------
+TYPE_STAMP = 30.0        # the timestamp, the largest type in the frame
+TYPE_STAMP_SUB = 17.0    # forecast offset under it
+TYPE_HEADING = 11.0
+TYPE_VALUE = 10.5        # city temperature — the number people look for
+TYPE_BODY = 9.5
+TYPE_LABEL = 9.5
+TYPE_CAPTION = 7.6
+TYPE_MICRO = 6.6
+
+WEIGHT_REGULAR = "normal"
+WEIGHT_BOLD = "bold"
+
+# -- Space and radius (px on the reference canvas) ---------------------------
+CANVAS_WIDTH_PX = 1000.0
+
+
+def canvas_height(settings: Settings) -> float:
+    """Frame height that renders the viewport without distorting shapes.
+
+    The map fills the canvas with `set_aspect("auto")`, so the canvas itself
+    has to carry the projection's aspect or the country comes out squashed.
+    In Plate Carree one degree of longitude covers cos(latitude) of the ground
+    that one degree of latitude does, which means:
+
+        height = width * (lat span / lon span) / cos(mid latitude)
+
+    Picking the height by eye instead is what flattened earlier versions: the
+    original 625px frame stretched China 14% too wide, and cropping the top
+    without recomputing the height took that to 19%. Deriving it here means
+    changing `Settings.bounds` can never reintroduce the distortion.
+    """
+
+    left_lon, right_lon, bottom_lat, top_lat = settings.bounds
+    middle = math.radians((bottom_lat + top_lat) / 2.0)
+    ratio = (top_lat - bottom_lat) / (right_lon - left_lon)
+    return round(CANVAS_WIDTH_PX * ratio / math.cos(middle))
+
+
+CANVAS_HEIGHT_PX = canvas_height(Settings())
+MARGIN = 24.0
+RADIUS_CARD = 12.0
+RADIUS_SMALL = 7.0
+HAIRLINE = 0.7
 
 ScreenRect = tuple[float, float, float, float]
 LabelCandidate = tuple[tuple[float, float], tuple[float, float]]
 
 # Layer contract, bottom to top:
-# basemap/weather (0-13) -> typhoon tracks -> fixed city markers/cards ->
-# numbered typhoon eyes -> fixed UI panels -> title/date. City cards never move
-# for a passing storm, while the critical numbered eye remains visible.
+# basemap/weather (0-13) -> typhoon tracks -> fixed city pills -> numbered
+# typhoon eyes -> fixed chrome -> header. City pills never move for a passing
+# storm; only the numbered eye travels across the map.
 Z_TYPHOON_TRACK = 20
-Z_TYPHOON_INFO = 33
+Z_CITY_LEADER = 34
 Z_CITY_SECONDARY_POINT = 35
 Z_CITY_SECONDARY_CARD = 36
 Z_CITY_PRIMARY_POINT = 37
@@ -110,54 +178,76 @@ PRIMARY_CITY_KEYS = {
     "taipei",
 }
 
-# Every city uses one identical card template. Its dimensions, typography and
-# full weather-icon slot never change as temperatures or conditions update.
-CITY_CARD_WIDTH_POINTS = 56.0
-CITY_CARD_HEIGHT_POINTS = 32.0
-CITY_NAME_FONT_SIZE = 8.4
-CITY_TEMPERATURE_FONT_SIZE = 8.8
+# Every city uses one identical capsule. Its width, height, typography and
+# icon slot never change as the temperature or the condition updates, so the
+# map keeps a single rhythm instead of 22 differently sized boxes.
+# Columns are sized from measured text rather than guessed: the widest Korean
+# city name on the map ("타이베이") is 32.8pt at TYPE_LABEL and the widest
+# temperature ("-15°") is 16.7pt at TYPE_VALUE. Padding and the icon are kept
+# tight because every extra point of capsule width costs label placement on
+# the crowded south east coast.
+#   4 pad | 12 icon | 3.5 | 33 name | 3.5 | 17 value | 4 pad  =  77
+CITY_CARD_WIDTH_POINTS = 77.0
+CITY_CARD_HEIGHT_POINTS = 19.0
+CITY_NAME_FONT_SIZE = TYPE_LABEL
+CITY_TEMPERATURE_FONT_SIZE = TYPE_VALUE
+CITY_ICON_SCALE = 0.60
+CITY_LEADER_MIN_PX = 10.0
 
-TYPHOON_PANEL_LEFT = 0.018
-TYPHOON_PANEL_TOP = 0.842
-TYPHOON_PANEL_WIDTH = 0.215
-TYPHOON_PANEL_HEADER_HEIGHT = 0.046
-TYPHOON_PANEL_ROW_HEIGHT = 0.072
-TYPHOON_PANEL_FOOTER_HEIGHT = 0.032
-TYPHOON_PANEL_BOTTOM_PADDING = 0.008
+# Sea south-east of Taiwan: far enough from the island to stay legible, close
+# enough to read as its label. Reserved so no city capsule lands on top of it.
+TAIWAN_LABEL_LONLAT = (122.5, 22.1)
+
+# -- Chrome layout (px from the left, and from the top or the bottom) --------
+# The frame carries no title. The only thing at the top is the timestamp, set
+# large enough to read at a glance, over the empty land in the north west.
+# Line tops, not baselines. The gaps between them are deliberate: at these
+# sizes the rendered lines are 36px, 21px and 12px tall, so an 18px gap is what
+# keeps the block from reading as one dense lump.
+STAMP_DATE_TOP = 26.0
+STAMP_OFFSET_TOP = 80.0
+STAMP_BADGE_TOP = 118.0
+STAMP_BLOCK_WIDTH = 360.0
+STAMP_BLOCK_BOTTOM = 150.0
+
+# One information column in the bottom left, over Tibet and Xinjiang — the
+# only large area of the map with no cities in it. Both cards share a width
+# so the column reads as a single block.
+COLUMN_LEFT = MARGIN
+COLUMN_WIDTH = 272.0
+COLUMN_GAP = 12.0
+
+LEGEND_BOTTOM = 30.0
+LEGEND_HEIGHT = 68.0
+LEGEND_BAR_INSET = 16.0
+LEGEND_BAR_HEIGHT = 9.0
+
+PANEL_BOTTOM = LEGEND_BOTTOM + LEGEND_HEIGHT + COLUMN_GAP
+PANEL_HEADER_HEIGHT = 38.0
+PANEL_ROW_HEIGHT = 56.0
+PANEL_FOOTER_HEIGHT = 30.0
+PANEL_PADDING = 8.0
+
+PROGRESS_HEIGHT = 3.0
+# The credit sits bottom left, under the legend it belongs with. The old
+# bottom-right corner is exactly where Pacific typhoons enter the frame.
+ATTRIBUTION_BOTTOM = 15.0
 
 PRECIP_LEVELS = [0.2, 1, 3, 6, 10, 20, 40, 80]
+# One hue, eight steps, monotonically darker. A single ramp keeps the rain
+# readable as an amount rather than as a set of unrelated colors.
 PRECIP_COLORS = [
-    "#E3F2FF",
-    "#CBE7FF",
-    "#ACD8FF",
-    "#82C2FF",
-    "#57A6FF",
-    "#3182F6",
-    "#1B64DA",
-    "#0B3F9B",
+    "#DCEAF9",
+    "#C1DCF6",
+    "#A1CAF2",
+    "#7CB4EC",
+    "#569BE4",
+    "#2F80DA",
+    "#1961BE",
+    "#0C4593",
 ]
 PRECIP_CMAP = mcolors.ListedColormap(PRECIP_COLORS)
 PRECIP_NORM = mcolors.BoundaryNorm(PRECIP_LEVELS + [160], PRECIP_CMAP.N)
-
-
-def _glass_path_effects(
-    *,
-    shadow_color: str = GLASS_SHADOW,
-    shadow_alpha: float = 0.13,
-    shadow_offset: tuple[float, float] = (0.0, -1.2),
-    highlight: str = "#FFFFFFB8",
-) -> list[path_effects.AbstractPathEffect]:
-    """Return the shared optical edge and depth treatment for floating UI."""
-
-    return [
-        path_effects.SimplePatchShadow(
-            offset=shadow_offset,
-            shadow_rgbFace=shadow_color,
-            alpha=shadow_alpha,
-        ),
-        path_effects.Stroke(linewidth=1.15, foreground=highlight),
-        path_effects.Normal(),
-    ]
 
 
 def _configure_font() -> str:
@@ -181,6 +271,237 @@ def _configure_font() -> str:
 
 
 FONT_FAMILY = _configure_font()
+
+
+def _bold_is_synthetic(family: str) -> bool:
+    """True when asking for bold would silently render at regular weight.
+
+    Korean families are usually shipped as a single `.ttc` collection, and
+    matplotlib registers only one face out of it — on macOS every weight of
+    Apple SD Gothic Neo resolves to the same file, so `fontweight="bold"`
+    changes nothing at all. When that is the case the renderer thickens the
+    glyph outline itself instead, which looks the same on any machine.
+    """
+
+    normal = font_manager.findfont(
+        font_manager.FontProperties(family=family, weight="normal")
+    )
+    bold = font_manager.findfont(
+        font_manager.FontProperties(family=family, weight="bold")
+    )
+    return normal == bold
+
+
+SYNTHETIC_BOLD = _bold_is_synthetic(FONT_FAMILY)
+if SYNTHETIC_BOLD:
+    LOGGER.info("%s has no bold face; emphasis is drawn by stroking", FONT_FAMILY)
+
+
+def _text_effects(
+    color: str,
+    size_points: float,
+    *,
+    bold: bool = False,
+    halo: bool = False,
+) -> list[path_effects.AbstractPathEffect]:
+    """Weight and legibility treatment for one piece of type.
+
+    Both strokes scale with the font size so the optical weight stays constant
+    from the 6pt captions to the 21pt timestamp.
+    """
+
+    effects: list[path_effects.AbstractPathEffect] = []
+    if halo:
+        effects.append(
+            path_effects.Stroke(
+                linewidth=max(2.0, size_points * 0.22),
+                foreground="#FFFFFFDD",
+            )
+        )
+    if bold and SYNTHETIC_BOLD:
+        effects.append(
+            path_effects.Stroke(linewidth=size_points * 0.075, foreground=color)
+        )
+    effects.append(path_effects.Normal())
+    return effects
+
+
+def _card_shadow(alpha: float = 0.10) -> list[path_effects.AbstractPathEffect]:
+    """The single elevation treatment shared by every floating surface."""
+
+    return [
+        path_effects.SimplePatchShadow(
+            offset=(0.0, -1.4),
+            shadow_rgbFace=CARD_SHADOW,
+            alpha=alpha,
+        ),
+        path_effects.Normal(),
+    ]
+
+
+def _halo(width: float = 2.4, color: str = "#FFFFFFD9") -> list[path_effects.AbstractPathEffect]:
+    """Keeps small type legible where it sits directly on the weather layer."""
+
+    return [
+        path_effects.Stroke(linewidth=width, foreground=color),
+        path_effects.Normal(),
+    ]
+
+
+class _Chrome:
+    """Pixel-space layout helper for the fixed user interface.
+
+    Chrome is drawn in display coordinates rather than axes fractions so that
+    a 12px corner radius is 12px on both axes. Everything is authored against
+    the 1000x618 reference canvas and multiplied by one scale factor, so the
+    same code renders correctly at another figure size or dpi.
+
+    Vertical positions are measured up from the bottom, because every card
+    lives in the bottom left column. The one top-anchored element, the
+    timestamp, converts through `from_top`.
+    """
+
+    def __init__(self, ax: plt.Axes) -> None:
+        width, height = ax.figure.canvas.get_width_height()
+        self.ax = ax
+        self.width = float(width)
+        self.height = float(height)
+        self.scale = self.width / CANVAS_WIDTH_PX
+        self.transform = IdentityTransform()
+
+    # -- coordinates --------------------------------------------------------
+    def x(self, px: float) -> float:
+        return px * self.scale
+
+    def up(self, px_from_bottom: float) -> float:
+        return px_from_bottom * self.scale
+
+    def from_top(self, px_from_top: float) -> float:
+        """Reference-space y for something pinned to the top of the canvas."""
+
+        return self.height / self.scale - px_from_top
+
+    def s(self, px: float) -> float:
+        return px * self.scale
+
+    def f(self, points: float) -> float:
+        return points * self.scale
+
+    # -- primitives ---------------------------------------------------------
+    def card(
+        self,
+        left: float,
+        bottom: float,
+        width: float,
+        height: float,
+        *,
+        radius: float = RADIUS_CARD,
+        facecolor: str = CARD_FILL,
+        edgecolor: str = CARD_HAIRLINE,
+        shadow: float = 0.10,
+        zorder: int = Z_FIXED_UI,
+        gid: str | None = None,
+    ) -> FancyBboxPatch:
+        """`bottom` is measured up from the bottom edge of the canvas."""
+
+        patch = FancyBboxPatch(
+            (self.x(left), self.up(bottom)),
+            self.s(width),
+            self.s(height),
+            transform=self.transform,
+            boxstyle=f"round,pad=0,rounding_size={self.s(radius)}",
+            mutation_aspect=1.0,
+            facecolor=facecolor,
+            edgecolor=edgecolor,
+            linewidth=HAIRLINE,
+            clip_on=False,
+            zorder=zorder,
+        )
+        if gid:
+            patch.set_gid(gid)
+        if shadow:
+            patch.set_path_effects(_card_shadow(shadow))
+        self.ax.add_patch(patch)
+        return patch
+
+    def text(
+        self,
+        left: float,
+        bottom: float,
+        value: str,
+        *,
+        size: float = TYPE_BODY,
+        color: str = LABEL,
+        weight: str = WEIGHT_REGULAR,
+        ha: str = "left",
+        va: str = "center",
+        zorder: int = Z_FIXED_UI_TEXT,
+        halo: bool = False,
+        gid: str | None = None,
+    ) -> Text:
+        artist = self.ax.text(
+            self.x(left),
+            self.up(bottom),
+            value,
+            transform=self.transform,
+            color=color,
+            fontsize=self.f(size),
+            fontweight=weight,
+            fontfamily=FONT_FAMILY,
+            ha=ha,
+            va=va,
+            clip_on=False,
+            zorder=zorder,
+        )
+        artist.set_path_effects(
+            _text_effects(
+                color,
+                self.f(size),
+                bold=weight == WEIGHT_BOLD,
+                halo=halo,
+            )
+        )
+        if gid:
+            artist.set_gid(gid)
+        return artist
+
+    def rule(
+        self,
+        left: float,
+        bottom: float,
+        length: float,
+        *,
+        vertical: bool = False,
+        color: str = SEPARATOR,
+        linewidth: float = HAIRLINE,
+        zorder: int = Z_FIXED_UI_TEXT,
+    ) -> None:
+        if vertical:
+            xs = [self.x(left), self.x(left)]
+            ys = [self.up(bottom), self.up(bottom + length)]
+        else:
+            xs = [self.x(left), self.x(left + length)]
+            ys = [self.up(bottom), self.up(bottom)]
+        self.ax.plot(
+            xs,
+            ys,
+            transform=self.transform,
+            color=color,
+            linewidth=linewidth,
+            solid_capstyle="butt",
+            clip_on=False,
+            zorder=zorder,
+        )
+
+    def rect(self, left: float, bottom: float, width: float, height: float) -> ScreenRect:
+        """Reserved-area rectangle in the (x0, y0, x1, y1) screen convention."""
+
+        return (
+            self.x(left),
+            self.up(bottom),
+            self.x(left + width),
+            self.up(bottom + height),
+        )
 
 
 @lru_cache(maxsize=1)
@@ -274,54 +595,65 @@ def _weather_icon(
     *,
     origin_x: float = 0.0,
     origin_y: float = 0.0,
+    scale: float = 1.0,
 ) -> DrawingArea:
+    """Draw one glyph from the weather set inside a nominal 20x18 point box.
+
+    Every glyph is built from the same three primitives (disc, cloud, stroke)
+    at the same optical weight, so a sunny city and a rainy city carry equal
+    visual mass in the layout.
+    """
+
     kind = _condition_kind(condition)
-    drawing = drawing or DrawingArea(20, 18, 0, 0)
-    cloud = "#A8B2BD"
-    sun = "#FFB13B"
-    rain = PRIMARY
+    drawing = drawing or DrawingArea(20 * scale, 18 * scale, 0, 0)
+    stroke = 1.2 * scale
 
     def x(value: float) -> float:
-        return origin_x + value
+        return origin_x + value * scale
 
     def y(value: float) -> float:
-        return origin_y + value
+        return origin_y + value * scale
 
     def add_sun(cx: float = 9.5, cy: float = 9.5, radius: float = 4.0) -> None:
         for angle in range(0, 360, 45):
             radians = np.radians(angle)
             drawing.add_artist(
                 Line2D(
-                    [x(cx + np.cos(radians) * 5.3), x(cx + np.cos(radians) * 7.0)],
-                    [y(cy + np.sin(radians) * 5.3), y(cy + np.sin(radians) * 7.0)],
-                    color=sun,
-                    linewidth=1.15,
+                    [x(cx + np.cos(radians) * 5.4), x(cx + np.cos(radians) * 7.0)],
+                    [y(cy + np.sin(radians) * 5.4), y(cy + np.sin(radians) * 7.0)],
+                    color=ICON_SUN,
+                    linewidth=stroke,
                     solid_capstyle="round",
                 )
             )
         drawing.add_artist(
-            Circle((x(cx), y(cy)), radius, facecolor=sun, edgecolor="none")
+            Circle((x(cx), y(cy)), radius * scale, facecolor=ICON_SUN, edgecolor="none")
         )
 
-    def add_cloud(cx: float = 10.0, cy: float = 9.0, scale: float = 1.0) -> None:
+    def add_cloud(cx: float = 10.0, cy: float = 9.0, size: float = 1.0) -> None:
+        body = size * scale
         drawing.add_artist(
             Ellipse(
-                (x(cx), y(cy - 1.2 * scale)),
-                15 * scale,
-                6.5 * scale,
-                facecolor=cloud,
+                (x(cx), y(cy - 1.2 * size)),
+                15 * body,
+                6.5 * body,
+                facecolor=ICON_CLOUD,
                 edgecolor="none",
             )
         )
-        drawing.add_artist(
-            Circle((x(cx - 4.0 * scale), y(cy + 0.4 * scale)), 3.4 * scale, facecolor=cloud, edgecolor="none")
-        )
-        drawing.add_artist(
-            Circle((x(cx + 0.2 * scale), y(cy + 2.0 * scale)), 4.2 * scale, facecolor=cloud, edgecolor="none")
-        )
-        drawing.add_artist(
-            Circle((x(cx + 4.1 * scale), y(cy + 0.2 * scale)), 3.2 * scale, facecolor=cloud, edgecolor="none")
-        )
+        for offset_x, offset_y, radius in (
+            (-4.0, 0.4, 3.4),
+            (0.2, 2.0, 4.2),
+            (4.1, 0.2, 3.2),
+        ):
+            drawing.add_artist(
+                Circle(
+                    (x(cx + offset_x * size), y(cy + offset_y * size)),
+                    radius * body,
+                    facecolor=ICON_CLOUD,
+                    edgecolor="none",
+                )
+            )
 
     if kind == "clear":
         add_sun()
@@ -334,10 +666,10 @@ def _weather_icon(
             for rain_x in (6.3, 10.2, 14.1):
                 drawing.add_artist(
                     Line2D(
-                        [origin_x + rain_x, origin_x + rain_x - 1.0],
+                        [x(rain_x), x(rain_x - 1.0)],
                         [y(5.2), y(2.2)],
-                        color=rain,
-                        linewidth=1.45,
+                        color=ICON_RAIN,
+                        linewidth=1.35 * scale,
                         solid_capstyle="round",
                     )
                 )
@@ -353,24 +685,35 @@ def _weather_icon(
                         (x(11.3), y(3.4)),
                     ],
                     closed=True,
-                    facecolor=sun,
+                    facecolor=ICON_SUN,
                     edgecolor="none",
                 )
             )
         else:
             for cx in (7, 13):
-                drawing.add_artist(Line2D([x(cx - 2), x(cx + 2)], [y(2.6), y(2.6)], color=rain, linewidth=1.0))
-                drawing.add_artist(Line2D([x(cx), x(cx)], [y(0.6), y(4.6)], color=rain, linewidth=1.0))
-                drawing.add_artist(Line2D([x(cx - 1.5), x(cx + 1.5)], [y(1.1), y(4.1)], color=rain, linewidth=0.9))
-                drawing.add_artist(Line2D([x(cx - 1.5), x(cx + 1.5)], [y(4.1), y(1.1)], color=rain, linewidth=0.9))
+                for x1, y1, x2, y2 in (
+                    (cx - 2, 2.6, cx + 2, 2.6),
+                    (cx, 0.6, cx, 4.6),
+                    (cx - 1.5, 1.1, cx + 1.5, 4.1),
+                    (cx - 1.5, 4.1, cx + 1.5, 1.1),
+                ):
+                    drawing.add_artist(
+                        Line2D(
+                            [x(x1), x(x2)],
+                            [y(y1), y(y2)],
+                            color=ICON_RAIN,
+                            linewidth=0.9 * scale,
+                            solid_capstyle="round",
+                        )
+                    )
     elif kind == "fog":
         for fog_y, width in ((12, 13), (8, 17), (4, 12)):
             drawing.add_artist(
                 Line2D(
                     [x(10 - width / 2), x(10 + width / 2)],
-                    [origin_y + fog_y, origin_y + fog_y],
-                    color=SUBTLE,
-                    linewidth=1.8,
+                    [y(fog_y), y(fog_y)],
+                    color=LABEL_TERTIARY,
+                    linewidth=1.6 * scale,
                     solid_capstyle="round",
                 )
             )
@@ -380,15 +723,17 @@ def _weather_icon(
 
 
 def _temperature_color(temperature_c: float | None) -> str:
+    """Four steps only, so the map never shows a gradient of near-identical reds."""
+
     if temperature_c is None:
-        return MUTED
+        return LABEL_TERTIARY
     if temperature_c <= 12:
-        return PRIMARY
+        return COOL
     if temperature_c >= 30:
-        return TYPHOON
+        return ALERT
     if temperature_c >= 27:
         return WARM
-    return INK
+    return LABEL
 
 
 def _city_card_content(
@@ -397,6 +742,8 @@ def _city_card_content(
     temperature: float | None,
     condition: str,
 ) -> DrawingArea:
+    """One capsule: icon, city, temperature — always in the same three columns."""
+
     temperature_label = f"{temperature:.0f}°" if temperature is not None else "--°"
     drawing = DrawingArea(
         CITY_CARD_WIDTH_POINTS,
@@ -404,45 +751,44 @@ def _city_card_content(
         0,
         0,
     )
-    drawing.add_artist(
-        Text(
-            CITY_CARD_WIDTH_POINTS / 2,
-            23.2,
-            label,
-            color=INK,
-            fontsize=CITY_NAME_FONT_SIZE,
-            fontweight="bold",
-            fontfamily=FONT_FAMILY,
-            ha="center",
-            va="center",
-        )
+    name = Text(
+        36.0,
+        9.7,
+        label,
+        color=LABEL,
+        fontsize=CITY_NAME_FONT_SIZE,
+        fontweight=WEIGHT_BOLD,
+        fontfamily=FONT_FAMILY,
+        ha="center",
+        va="center",
     )
-    # A tiny specular edge gives every fixed-size card the same glass depth
-    # without adding another visible divider or competing with the weather.
-    drawing.add_artist(
-        Line2D(
-            [10.0, CITY_CARD_WIDTH_POINTS - 10.0],
-            [CITY_CARD_HEIGHT_POINTS - 0.9, CITY_CARD_HEIGHT_POINTS - 0.9],
-            color=GLASS_HIGHLIGHT,
-            linewidth=0.75,
-            solid_capstyle="round",
-        )
-    )
-    _weather_icon(condition, drawing, origin_x=8.0, origin_y=0.6)
+    name.set_path_effects(_text_effects(LABEL, CITY_NAME_FONT_SIZE, bold=True))
+    drawing.add_artist(name)
 
-    drawing.add_artist(
-        Text(
-            38.0,
-            10.2,
-            temperature_label,
-            color=_temperature_color(temperature),
-            fontsize=CITY_TEMPERATURE_FONT_SIZE,
-            fontweight="bold",
-            fontfamily=FONT_FAMILY,
-            ha="center",
-            va="center",
-        )
+    _weather_icon(
+        condition,
+        drawing,
+        origin_x=4.0,
+        origin_y=4.1,
+        scale=CITY_ICON_SCALE,
     )
+
+    temperature_color = _temperature_color(temperature)
+    value = Text(
+        64.5,
+        9.5,
+        temperature_label,
+        color=temperature_color,
+        fontsize=CITY_TEMPERATURE_FONT_SIZE,
+        fontweight=WEIGHT_BOLD,
+        fontfamily=FONT_FAMILY,
+        ha="center",
+        va="center",
+    )
+    value.set_path_effects(
+        _text_effects(temperature_color, CITY_TEMPERATURE_FONT_SIZE, bold=True)
+    )
+    drawing.add_artist(value)
     return drawing
 
 
@@ -466,107 +812,135 @@ def _intersection_area(first: ScreenRect, second: ScreenRect) -> float:
 
 
 def _typhoon_panel_geometry(storm_count: int) -> tuple[float, float, float, float]:
+    """Panel box in reference pixels: (left, bottom, width, height)."""
+
     visible_count = min(3, max(0, storm_count))
     height = (
-        TYPHOON_PANEL_HEADER_HEIGHT
-        + visible_count * TYPHOON_PANEL_ROW_HEIGHT
-        + TYPHOON_PANEL_FOOTER_HEIGHT
-        + TYPHOON_PANEL_BOTTOM_PADDING
+        PANEL_HEADER_HEIGHT
+        + visible_count * PANEL_ROW_HEIGHT
+        + PANEL_FOOTER_HEIGHT
+        + PANEL_PADDING
     )
-    bottom = TYPHOON_PANEL_TOP - height
-    return TYPHOON_PANEL_LEFT, bottom, TYPHOON_PANEL_WIDTH, height
+    return COLUMN_LEFT, PANEL_BOTTOM, COLUMN_WIDTH, height
 
 
 def _label_reserved_boxes(
     ax: plt.Axes,
     typhoon_count: int = 0,
 ) -> list[ScreenRect]:
-    width, height = ax.figure.canvas.get_width_height()
+    """Screen areas the fixed chrome owns; city capsules must avoid them."""
+
+    chrome = _Chrome(ax)
     boxes = [
-        # Frameless title and sample badge.
-        (width * 0.012, height * 0.895, width * 0.34, height * 0.995),
-        # Date/time capsule.
-        (width * 0.715, height * 0.895, width * 0.995, height * 0.995),
-        # Rain legend and bottom progress line.
-        (0.0, 0.0, width * 0.35, height * 0.13),
-        (0.0, 0.0, float(width), height * 0.028),
-        # Attribution. The route-style key lives inside the west-side panel.
-        (width * 0.73, 0.0, float(width), height * 0.105),
+        # Timestamp block, top left, plus the sample badge under it.
+        chrome.rect(
+            MARGIN - 8.0,
+            chrome.from_top(STAMP_BLOCK_BOTTOM),
+            STAMP_BLOCK_WIDTH,
+            STAMP_BLOCK_BOTTOM - 16.0,
+        ),
+        # Rain legend, the credit line beneath it and the progress line.
+        chrome.rect(
+            COLUMN_LEFT - 8.0,
+            LEGEND_BOTTOM - 8.0,
+            COLUMN_WIDTH + 16.0,
+            LEGEND_HEIGHT + 16.0,
+        ),
+        chrome.rect(0.0, 0.0, 420.0, 24.0),
+        chrome.rect(0.0, 0.0, CANVAS_WIDTH_PX, 8.0),
     ]
-    # Reserve the largest supported panel even when no storm is active. This
-    # makes city placement independent from storms appearing, disappearing or
-    # changing count between GFS runs; only the panel's visible height changes.
-    left, bottom, panel_width, panel_height = _typhoon_panel_geometry(3)
-    boxes.append(
-        (
-            width * left,
-            height * bottom,
-            width * (left + panel_width),
-            height * (bottom + panel_height),
-        )
+    # The one map label that is not a city.
+    label_x, label_y = ccrs.PlateCarree()._as_mpl_transform(ax).transform(
+        TAIWAN_LABEL_LONLAT
     )
+    boxes.append((label_x - 6.0, label_y - 11.0, label_x + 34.0, label_y + 11.0))
+    # Reserve the tallest supported panel even when no storm is active, so the
+    # city layout is identical whether or not a storm exists in this GFS run.
+    left, bottom, width, height = _typhoon_panel_geometry(3)
+    boxes.append(chrome.rect(left - 8.0, bottom - 8.0, width + 16.0, height + 16.0))
     return boxes
 
 
-def _preferred_label_direction(offset: tuple[int, int]) -> str:
-    horizontal = "left" if offset[0] < 0 else "right"
+def _preferred_label_direction(offset: tuple[int, int]) -> tuple[float, float]:
+    horizontal = -1.0 if offset[0] < 0 else 1.0
     if offset[1] >= 12:
-        return f"upper_{horizontal}"
+        return (horizontal, 1.0)
     if offset[1] <= -12:
-        return f"lower_{horizontal}"
-    return horizontal
+        return (horizontal, -1.0)
+    return (horizontal, 0.0)
 
 
 def _city_label_candidates(offset: tuple[int, int]) -> list[LabelCandidate]:
-    directions: dict[str, tuple[float, float, tuple[float, float]]] = {
-        "right": (1.0, 0.0, (0.0, 0.5)),
-        "upper_right": (1.0, 1.0, (0.0, 0.0)),
-        "lower_right": (1.0, -1.0, (0.0, 1.0)),
-        "above": (0.0, 1.0, (0.5, 0.0)),
-        "below": (0.0, -1.0, (0.5, 1.0)),
-        "upper_left": (-1.0, 1.0, (1.0, 0.0)),
-        "lower_left": (-1.0, -1.0, (1.0, 1.0)),
-        "left": (-1.0, 0.0, (1.0, 0.5)),
-    }
-    preferred = _preferred_label_direction(offset)
-    preferred_vector = directions[preferred][:2]
+    """Positions for one capsule, nearest first.
 
-    def direction_score(name: str) -> tuple[float, int]:
-        vector = directions[name][:2]
-        dot = preferred_vector[0] * vector[0] + preferred_vector[1] * vector[1]
-        return (-dot, list(directions).index(name))
+    The old ladder walked eight directions at each ring before widening, so a
+    collision-free but very distant slot could win over a close one. Here every
+    candidate is scored by the capsule's actual centre-to-city distance plus a
+    small penalty for leaving the city's preferred side, and the whole pool is
+    sorted by that score. The result is that capsules stay next to their dot.
+    """
 
-    direction_order = sorted(directions, key=direction_score)
-    candidates: list[LabelCandidate] = []
-    for gap in (10.0, 17.0, 25.0, 34.0, 46.0, 60.0, 76.0, 94.0, 115.0):
-        for name in direction_order:
-            x_direction, y_direction, alignment = directions[name]
-            candidates.append(
-                ((x_direction * gap, y_direction * gap), alignment)
-            )
+    width = CITY_CARD_WIDTH_POINTS
+    height = CITY_CARD_HEIGHT_POINTS
+    preferred_x, preferred_y = _preferred_label_direction(offset)
+    # The tightest ring sits ~6pt off the dot, close enough that the capsule
+    # reads as attached and needs no leader line at all.
+    x_gaps = (6.0, 11.0, 17.0, 25.0, 35.0, 47.0, 62.0, 82.0, 106.0, 134.0)
+    y_gaps = (0.0, 8.0, 15.0, 24.0, 35.0, 48.0, 64.0, 84.0, 110.0)
+    pool: list[tuple[LabelCandidate, float, float]] = []
 
-    preferred_horizontal = -1.0 if offset[0] < 0 else 1.0
-    preferred_vertical = -1.0 if offset[1] < 0 else 1.0
-    extra_ranked: list[tuple[float, LabelCandidate]] = []
-    for x_direction in (preferred_horizontal, -preferred_horizontal):
-        for x_gap in (12.0, 22.0, 36.0, 54.0, 76.0, 102.0, 132.0, 162.0):
-            for y_direction in (preferred_vertical, -preferred_vertical):
-                for y_gap in (0.0, 18.0, 32.0, 50.0, 72.0, 98.0, 128.0, 160.0):
+    for x_direction in (preferred_x, -preferred_x):
+        for y_direction in (1.0, -1.0):
+            for x_gap in x_gaps:
+                for y_gap in y_gaps:
                     x_offset = x_direction * x_gap
                     y_offset = y_direction * y_gap
                     alignment = (1.0, 0.5) if x_offset < 0 else (0.0, 0.5)
-                    direction_penalty = 0.0
-                    if x_direction != preferred_horizontal:
-                        direction_penalty += 18.0
-                    if y_direction != preferred_vertical:
-                        direction_penalty += 10.0
-                    extra_ranked.append(
+                    pool.append(
                         (
-                            np.hypot(x_gap, y_gap) + direction_penalty,
                             ((x_offset, y_offset), alignment),
+                            x_direction,
+                            y_direction if y_gap else 0.0,
                         )
                     )
-    for _, candidate in sorted(extra_ranked, key=lambda item: item[0]):
+    # Stacked directly over or under the dot. Without these the only way to sit
+    # above a city is a wide diagonal, which wastes the vertical room that the
+    # crowded east coast actually has.
+    for y_direction in (1.0, -1.0):
+        for y_gap in (6.0, 11.0, 17.0, 25.0, 35.0, 47.0, 62.0):
+            for x_shift in (0.0, 20.0, -20.0, 38.0, -38.0):
+                alignment = (0.5, 0.0) if y_direction > 0 else (0.5, 1.0)
+                pool.append(
+                    (
+                        ((x_shift, y_direction * y_gap), alignment),
+                        1.0 if x_shift >= 0 else -1.0,
+                        y_direction,
+                    )
+                )
+
+    ranked: list[tuple[float, LabelCandidate]] = []
+    for candidate, x_direction, y_direction in pool:
+        (x_offset, y_offset), alignment = candidate
+        left = x_offset - alignment[0] * width
+        bottom = y_offset - alignment[1] * height
+        gap = float(
+            np.hypot(
+                max(left, 0.0, -(left + width)),
+                max(bottom, 0.0, -(bottom + height)),
+            )
+        )
+        # The city table's label_offset is a hint about which side looks best,
+        # not a rule; a modest penalty keeps it honoured whenever the room is
+        # there without exiling the capsule when it is not.
+        penalty = 0.0
+        if x_direction != preferred_x:
+            penalty += 10.0
+        if preferred_y and y_direction and y_direction != preferred_y:
+            penalty += 6.0
+        ranked.append((gap + penalty, candidate))
+
+    candidates: list[LabelCandidate] = []
+    for _, candidate in sorted(ranked, key=lambda item: item[0]):
         if candidate not in candidates:
             candidates.append(candidate)
     return candidates
@@ -637,6 +1011,113 @@ def _city_label_anchors(
     }
 
 
+def _anchor_gap(anchor: tuple[float, float], rectangle: ScreenRect) -> float:
+    """Shortest distance from a city dot to the edge of its capsule."""
+
+    return float(
+        np.hypot(
+            max(rectangle[0] - anchor[0], 0.0, anchor[0] - rectangle[2]),
+            max(rectangle[1] - anchor[1], 0.0, anchor[1] - rectangle[3]),
+        )
+    )
+
+
+def _resolve_city_layout(
+    ax: plt.Axes,
+    city_weather: dict[str, CityWeather],
+    occupied_boxes: list[ScreenRect],
+    anchors: dict[str, tuple[float, float]],
+) -> tuple[list[CityWeather], dict[str, tuple[tuple[float, float], tuple[float, float], ScreenRect]]]:
+    """Decide where every capsule sits, before anything is drawn.
+
+    Placement is greedy and therefore order-dependent: whichever city is
+    resolved last has to take what is left, which is how Macau used to end up
+    six hundred kilometres inland. So the greedy pass is followed by a few
+    improvement rounds — each capsule, worst-placed first, is lifted out and
+    re-resolved against everyone else's final position, and kept only if it
+    lands closer to its own dot. Both passes depend only on the city table and
+    the fixed viewport, so every frame gets the identical layout.
+    """
+
+    points_to_pixels = ax.figure.dpi / 72.0
+    width = CITY_CARD_WIDTH_POINTS * points_to_pixels
+    height = CITY_CARD_HEIGHT_POINTS * points_to_pixels
+
+    def crowding(weather: CityWeather) -> float:
+        anchor = anchors[weather.city.key]
+        pressure = 0.0
+        for other in anchors.values():
+            distance = float(np.hypot(other[0] - anchor[0], other[1] - anchor[1]))
+            if distance < 200.0:
+                # Weighted by nearness, so Macau (three neighbours within one
+                # capsule width) outranks Sanya (neighbours, but none touching).
+                pressure += 1.0 - distance / 200.0
+        return pressure
+
+    ordered_weather = sorted(
+        city_weather.values(),
+        key=lambda weather: (
+            -round(crowding(weather), 6),
+            weather.city.key not in PRIMARY_CITY_KEYS,
+            -weather.city.longitude,
+        ),
+    )
+    candidates = {
+        weather.city.key: _city_label_candidates(weather.city.label_offset)
+        for weather in ordered_weather
+    }
+    placements: dict[
+        str, tuple[tuple[float, float], tuple[float, float], ScreenRect]
+    ] = {}
+
+    def resolve(weather: CityWeather) -> tuple[
+        tuple[float, float], tuple[float, float], ScreenRect, bool
+    ]:
+        key = weather.city.key
+        blocked = list(occupied_boxes)
+        blocked.extend(
+            placement[2] for other, placement in placements.items() if other != key
+        )
+        return _select_label_placement(
+            ax,
+            anchors[key],
+            width,
+            height,
+            candidates[key],
+            blocked,
+        )
+
+    for weather in ordered_weather:
+        offset, alignment, rectangle, collision_free = resolve(weather)
+        if not collision_free:
+            LOGGER.warning(
+                "City label placement required overlap fallback: %s",
+                weather.city.label,
+            )
+        placements[weather.city.key] = (offset, alignment, rectangle)
+
+    for _ in range(3):
+        improved = False
+        worst_first = sorted(
+            ordered_weather,
+            key=lambda weather: (
+                -_anchor_gap(anchors[weather.city.key], placements[weather.city.key][2]),
+                weather.city.key,
+            ),
+        )
+        for weather in worst_first:
+            key = weather.city.key
+            current_gap = _anchor_gap(anchors[key], placements[key][2])
+            offset, alignment, rectangle, collision_free = resolve(weather)
+            if collision_free and _anchor_gap(anchors[key], rectangle) < current_gap - 0.5:
+                placements[key] = (offset, alignment, rectangle)
+                improved = True
+        if not improved:
+            break
+
+    return ordered_weather, placements
+
+
 def _draw_city_cards(
     ax: plt.Axes,
     frame: FrameData,
@@ -645,11 +1126,14 @@ def _draw_city_cards(
     anchors: dict[str, tuple[float, float]],
 ) -> list[ScreenRect]:
     coordinate_transform = ccrs.PlateCarree()._as_mpl_transform(ax)
-    ordered_weather = sorted(
-        city_weather.values(),
-        key=lambda weather: weather.city.key not in PRIMARY_CITY_KEYS,
+    ordered_weather, placements = _resolve_city_layout(
+        ax,
+        city_weather,
+        occupied_boxes,
+        anchors,
     )
     occupied = list(occupied_boxes)
+    estimated_height = CITY_CARD_HEIGHT_POINTS * ax.figure.dpi / 72.0
 
     for weather in ordered_weather:
         city = weather.city
@@ -663,33 +1147,58 @@ def _draw_city_cards(
             temperature,
             condition,
         )
+        dot_color = (
+            TAIWAN
+            if city.key in {"taipei", "taichung", "kaohsiung"}
+            else ACCENT
+        )
 
         ax.scatter(
             [city.longitude],
             [city.latitude],
-            s=20,
-            c=PRIMARY if city.key not in {"taipei", "taichung", "kaohsiung"} else TAIWAN,
+            s=17,
+            c=dot_color,
             edgecolors=SURFACE,
-            linewidths=1.0,
+            linewidths=1.1,
             transform=ccrs.PlateCarree(),
             zorder=Z_CITY_PRIMARY_POINT if is_primary else Z_CITY_SECONDARY_POINT,
         )
 
-        points_to_pixels = ax.figure.dpi / 72.0
-        estimated_width = CITY_CARD_WIDTH_POINTS * points_to_pixels
-        estimated_height = CITY_CARD_HEIGHT_POINTS * points_to_pixels
-        offset, alignment, rectangle, collision_free = _select_label_placement(
-            ax,
-            anchors[city.key],
-            estimated_width,
-            estimated_height,
-            _city_label_candidates(city.label_offset),
-            occupied,
-        )
-        if not collision_free:
-            LOGGER.warning("City label placement required overlap fallback: %s", city.label)
+        offset, alignment, rectangle = placements[city.key]
         occupied.append(rectangle)
 
+        # A capsule touching its dot needs no leader; one pushed away by the
+        # coastal crowd gets a hairline that is actually visible, unlike the
+        # 38%-alpha line the old layout drew under every card.
+        #
+        # The leader is a separate line rather than the annotation's own arrow
+        # because an AnnotationBbox draws its arrow at its own z, so Taipei's
+        # leader used to run straight across the Kaohsiung capsule below it.
+        # Drawn here it sits under every capsule and simply disappears behind
+        # the one it points at.
+        anchor = anchors[city.key]
+        if _anchor_gap(anchor, rectangle) > CITY_LEADER_MIN_PX:
+            leader = ax.plot(
+                [anchor[0], (rectangle[0] + rectangle[2]) / 2.0],
+                [anchor[1], (rectangle[1] + rectangle[3]) / 2.0],
+                transform=IdentityTransform(),
+                color=LABEL_TERTIARY,
+                linewidth=0.9,
+                solid_capstyle="round",
+                clip_on=False,
+                zorder=Z_CITY_LEADER,
+            )[0]
+            leader.set_path_effects(
+                [
+                    path_effects.Stroke(linewidth=2.6, foreground="#FFFFFFCC"),
+                    path_effects.Normal(),
+                ]
+            )
+
+        # An AnnotationBbox draws its frame in display pixels and multiplies
+        # the boxstyle by the mutation scale, which it takes from `prop`.
+        # Pinning the scale to 1 pt makes rounding_size a plain pixel value,
+        # so half the capsule height is a true pill at any dpi.
         annotation = AnnotationBbox(
             card,
             (city.longitude, city.latitude),
@@ -698,24 +1207,18 @@ def _draw_city_cards(
             boxcoords="offset points",
             box_alignment=alignment,
             frameon=True,
+            pad=0.0,
+            fontsize=1.0,
             bboxprops={
-                "boxstyle": "round,pad=0,rounding_size=0.85",
-                "facecolor": GLASS_SURFACE_STRONG,
-                "edgecolor": GLASS_EDGE,
-                "linewidth": 0.85,
-            },
-            arrowprops={
-                "arrowstyle": "-",
-                "color": GLASS_CONNECTOR,
-                "linewidth": 0.55,
-                "alpha": 0.38,
-                "shrinkA": 2,
-                "shrinkB": 4,
-                "connectionstyle": "arc3,rad=0.025",
+                "boxstyle": f"round,pad=0,rounding_size={estimated_height / 2}",
+                "mutation_aspect": 1.0,
+                "facecolor": CAPSULE_FILL,
+                "edgecolor": CARD_HAIRLINE,
+                "linewidth": HAIRLINE,
             },
             zorder=Z_CITY_PRIMARY_CARD if is_primary else Z_CITY_SECONDARY_CARD,
         )
-        annotation.patch.set_path_effects(_glass_path_effects())
+        annotation.patch.set_path_effects(_card_shadow(0.09))
         ax.add_artist(annotation)
     return occupied
 
@@ -743,16 +1246,16 @@ def _plot_track(
         linestyle=linestyle,
         linewidth=linewidth,
         marker=marker,
-        markersize=4.2,
+        markersize=3.6,
         markerfacecolor=SURFACE,
         markeredgecolor=color,
-        markeredgewidth=1.25,
+        markeredgewidth=1.1,
         transform=ccrs.PlateCarree(),
         zorder=zorder,
         solid_capstyle="round",
         dash_capstyle="round",
         path_effects=[
-            path_effects.Stroke(linewidth=linewidth + 2.6, foreground="#FFFFFFD9"),
+            path_effects.Stroke(linewidth=linewidth + 2.4, foreground="#FFFFFFCC"),
             path_effects.Normal(),
         ],
     )[0]
@@ -805,29 +1308,40 @@ def _draw_typhoon_swirl(
     storm_number: int,
     color: str,
 ) -> None:
+    """The eye: a soft halo, a solid disc, two arcs and the storm number."""
+
     transform = ccrs.PlateCarree()
+    ax.scatter(
+        [point.longitude],
+        [point.latitude],
+        s=760,
+        c=color,
+        alpha=0.16,
+        edgecolors="none",
+        transform=transform,
+        zorder=Z_TYPHOON_CORE - 1,
+    )
     core = ax.scatter(
         [point.longitude],
         [point.latitude],
-        s=360,
+        s=320,
         c=color,
         edgecolors=SURFACE,
-        linewidths=2.2,
+        linewidths=2.0,
         transform=transform,
         zorder=Z_TYPHOON_CORE,
-        path_effects=[path_effects.SimplePatchShadow(offset=(0, -1), alpha=0.22), path_effects.Normal()],
     )
     core.set_gid(f"typhoon-map-core-{storm_number}")
-    for width, theta1, theta2 in ((1.45, 24, 160), (1.45, 204, 340)):
+    for theta1, theta2 in ((24, 160), (204, 340)):
         ax.add_patch(
             Arc(
                 (point.longitude, point.latitude),
-                width=width,
-                height=width * 0.82,
+                width=1.35,
+                height=1.35 * 0.82,
                 theta1=theta1,
                 theta2=theta2,
                 color=SURFACE,
-                linewidth=1.8,
+                linewidth=1.6,
                 transform=transform,
                 zorder=Z_TYPHOON_CORE + 1,
             )
@@ -835,7 +1349,7 @@ def _draw_typhoon_swirl(
     ax.add_patch(
         Circle(
             (point.longitude, point.latitude),
-            radius=0.34,
+            radius=0.32,
             facecolor=SURFACE,
             edgecolor="none",
             transform=transform,
@@ -848,12 +1362,13 @@ def _draw_typhoon_swirl(
         str(storm_number),
         transform=transform,
         color=color,
-        fontsize=6.4,
-        fontweight="bold",
+        fontsize=TYPE_CAPTION,
+        fontweight=WEIGHT_BOLD,
         ha="center",
         va="center",
         zorder=Z_TYPHOON_CORE + 3,
     )
+    number.set_path_effects(_text_effects(color, TYPE_CAPTION, bold=True))
     number.set_gid(f"typhoon-map-number-{storm_number}")
 
 
@@ -895,531 +1410,159 @@ def _compact_label_value(value: str, limit: int) -> str:
     return f"{cleaned[: limit - 1]}…"
 
 
-def _draw_typhoon_info_pill(
-    ax: plt.Axes,
-    typhoon: Typhoon,
-    point: StormPoint,
-    storm_index: int,
-    occupied: list[ScreenRect],
-) -> None:
-    current = typhoon.current
-    if current is None:
-        return
-
+def _storm_vitals(typhoon: Typhoon, point: StormPoint) -> tuple[str, str]:
+    current = typhoon.current or point
     pressure = point.pressure_hpa if point.pressure_hpa is not None else current.pressure_hpa
     wind = point.wind_speed_ms if point.wind_speed_ms is not None else current.wind_speed_ms
     movement_point = point if point.move_direction or point.move_speed_kmh else current
-    vitals = []
+
+    vitals: list[str] = []
     if pressure is not None:
         vitals.append(f"{pressure:.0f} hPa")
     if wind is not None:
         vitals.append(f"{wind:.0f} m/s")
-    movement = _move_direction_ko(movement_point.move_direction) if movement_point.move_direction else ""
-    if movement_point.move_speed_kmh is not None:
-        movement = f"{movement}  ·  {movement_point.move_speed_kmh:.0f} km/h".strip(" ·")
-
-    # A narrow, stacked card stays close to the storm even in the crowded
-    # Taiwan / south-east China corridor. Name, number, intensity and movement
-    # remain readable without forcing a several-hundred-pixel leader line.
-    display_name = _compact_label_value(typhoon.name or "이름 확인 중", 7)
-    display_id = _compact_label_value(typhoon.storm_id, 11)
     vitals_text = "  ·  ".join(vitals) if vitals else "중심 정보 확인 중"
-    movement_text = movement or "이동 정보 확인 중"
 
-    card_width_points = 82.0
-    card_height_points = 43.0
-    card_content = DrawingArea(card_width_points, card_height_points, 0, 0)
-    # A small optical cyclone mark, restrained type hierarchy and a separator
-    # make the alert readable as a designed component instead of raw API text.
-    card_content.add_artist(
-        Circle((8.2, 34.0), 4.8, facecolor="#FFFFFF2E", edgecolor="#FFFFFF5C", linewidth=0.5)
+    movement = (
+        _move_direction_ko(movement_point.move_direction)
+        if movement_point.move_direction
+        else "이동 정보 확인 중"
     )
-    card_content.add_artist(
-        Arc((8.2, 34.0), 5.7, 4.6, theta1=20, theta2=175, color=SURFACE, linewidth=0.8)
-    )
-    card_content.add_artist(
-        Arc((8.2, 34.0), 5.7, 4.6, theta1=200, theta2=350, color=SURFACE, linewidth=0.8)
-    )
-    card_content.add_artist(
-        Text(
-            15.0,
-            34.1,
-            f"태풍 {display_name}",
-            color=SURFACE,
-            fontsize=6.6,
-            fontweight="bold",
-            fontfamily=FONT_FAMILY,
-            ha="left",
-            va="center",
-        )
-    )
-    card_content.add_artist(
-        Text(
-            card_width_points - 5.0,
-            34.0,
-            display_id,
-            color="#FFE7EB",
-            fontsize=4.6,
-            fontweight="semibold",
-            fontfamily=FONT_FAMILY,
-            ha="right",
-            va="center",
-        )
-    )
-    card_content.add_artist(
-        Line2D(
-            [6.0, card_width_points - 6.0],
-            [26.3, 26.3],
-            color="#FFFFFF52",
-            linewidth=0.55,
-            solid_capstyle="round",
-        )
-    )
-    card_content.add_artist(
-        Text(
-            7.0,
-            18.8,
-            vitals_text,
-            color=SURFACE,
-            fontsize=5.9,
-            fontweight="semibold",
-            fontfamily=FONT_FAMILY,
-            ha="left",
-            va="center",
-        )
-    )
-    card_content.add_artist(
-        Text(
-            7.0,
-            9.5,
-            movement_text,
-            color="#FFF0F2",
-            fontsize=5.65,
-            fontweight="semibold",
-            fontfamily=FONT_FAMILY,
-            ha="left",
-            va="center",
-        )
-    )
-
-    lon_min, lon_max, lat_min, lat_max = ax.get_extent(ccrs.PlateCarree())
-    place_left = point.longitude > (lon_min + lon_max) / 2
-    place_below = point.latitude > lat_min + (lat_max - lat_min) * 0.74
-    coordinate_transform = ccrs.PlateCarree()._as_mpl_transform(ax)
-    anchor = tuple(
-        coordinate_transform.transform((point.longitude, point.latitude))
-    )
-    points_to_pixels = ax.figure.dpi / 72.0
-    label_width = card_width_points * points_to_pixels
-    label_height = card_height_points * points_to_pixels
-
-    preferred_horizontal = -1.0 if place_left else 1.0
-    preferred_vertical = -1.0 if place_below else 1.0
-    ranked_candidates: list[tuple[float, LabelCandidate]] = []
-    for x_direction in (preferred_horizontal, -preferred_horizontal):
-        for y_direction in (preferred_vertical, -preferred_vertical):
-            for x_gap in (18.0, 28.0, 42.0, 60.0, 82.0, 108.0, 138.0):
-                for y_gap in (26.0, 42.0, 62.0, 86.0, 115.0, 150.0, 190.0, 230.0):
-                    x_offset = x_direction * x_gap
-                    y_offset = y_direction * (y_gap + storm_index * 8.0)
-                    alignment = (1.0, 0.5) if x_offset < 0 else (0.0, 0.5)
-                    direction_penalty = 0.0
-                    if x_direction != preferred_horizontal:
-                        direction_penalty += 24.0
-                    if y_direction != preferred_vertical:
-                        direction_penalty += 14.0
-                    distance = np.hypot(x_gap, y_gap) + direction_penalty
-                    ranked_candidates.append(
-                        (distance, ((x_offset, y_offset), alignment))
-                    )
-        for x_gap in (28.0, 48.0, 72.0, 100.0, 132.0):
-            x_offset = x_direction * x_gap
-            alignment = (1.0, 0.5) if x_offset < 0 else (0.0, 0.5)
-            direction_penalty = 0.0 if x_direction == preferred_horizontal else 24.0
-            ranked_candidates.append(
-                (x_gap + direction_penalty, ((x_offset, 0.0), alignment))
-            )
-    candidate_pool = [
-        candidate
-        for _, candidate in sorted(ranked_candidates, key=lambda item: item[0])
-    ]
-
-    # If the nearby area is crowded, search the full canvas. These candidates
-    # are intentionally appended after the local choices so the pill remains
-    # near the storm whenever possible while the city cards stay fixed.
-    canvas_width, canvas_height = ax.figure.canvas.get_width_height()
-    global_ranked: list[tuple[float, LabelCandidate]] = []
-    max_left = max(10.0, canvas_width - label_width - 10.0)
-    for left in np.linspace(10.0, max_left, 42):
-        for center_y in np.linspace(32.0, canvas_height - 32.0, 30):
-            offset = (
-                (left - anchor[0]) / points_to_pixels,
-                (center_y - anchor[1]) / points_to_pixels,
-            )
-            distance = np.hypot(
-                left + label_width / 2.0 - anchor[0],
-                center_y - anchor[1],
-            )
-            global_ranked.append((distance, (offset, (0.0, 0.5))))
-    for _, candidate in sorted(global_ranked, key=lambda item: item[0]):
-        if candidate not in candidate_pool:
-            candidate_pool.append(candidate)
-
-    # Rank local and full-canvas candidates together by the card's actual
-    # centre-to-storm distance. Previously every local candidate was tried
-    # before the canvas search, so a collision-free but very remote local
-    # position could win even when a much closer slot existed.
-    def card_distance(candidate: LabelCandidate) -> float:
-        candidate_offset, candidate_alignment = candidate
-        reference_x = anchor[0] + candidate_offset[0] * points_to_pixels
-        reference_y = anchor[1] + candidate_offset[1] * points_to_pixels
-        center_x = reference_x + (0.5 - candidate_alignment[0]) * label_width
-        center_y = reference_y + (0.5 - candidate_alignment[1]) * label_height
-        return float(np.hypot(center_x - anchor[0], center_y - anchor[1]))
-
-    candidates = sorted(candidate_pool, key=card_distance)
-
-    offset, box_alignment, rectangle, collision_free = _select_label_placement(
-        ax,
-        anchor,
-        label_width,
-        label_height,
-        candidates,
-        occupied,
-    )
-    if not collision_free:
-        LOGGER.warning("Typhoon label placement required overlap fallback: %s", typhoon.name)
-    occupied.append(rectangle)
-    curve_direction = 0.08 if box_alignment[0] == 1.0 else -0.08
-    annotation = AnnotationBbox(
-        card_content,
-        (point.longitude, point.latitude),
-        xybox=offset,
-        xycoords=coordinate_transform,
-        boxcoords="offset points",
-        box_alignment=box_alignment,
-        frameon=True,
-        bboxprops={
-            "boxstyle": "round,pad=0.52,rounding_size=1.2",
-            "facecolor": "#E94655EE",
-            "edgecolor": GLASS_EDGE,
-            "linewidth": 0.9,
-        },
-        arrowprops={
-            "arrowstyle": "-",
-            "color": "#D54855",
-            "linewidth": 0.75,
-            "alpha": 0.68,
-            "shrinkA": 4,
-            "shrinkB": 9,
-            "connectionstyle": f"arc3,rad={curve_direction}",
-        },
-        zorder=Z_TYPHOON_INFO,
-    )
-    annotation.patch.set_path_effects(
-        _glass_path_effects(
-            shadow_color="#7F1D2D",
-            shadow_alpha=0.18,
-            highlight="#FFFFFFA8",
-        )
-    )
-    ax.add_artist(annotation)
+    if movement_point.move_speed_kmh is not None:
+        movement = f"{movement}  ·  {movement_point.move_speed_kmh:.0f} km/h"
+    return vitals_text, movement
 
 
 def _draw_typhoon_panel(
     ax: plt.Axes,
     storms: list[tuple[int, Typhoon, StormPoint, str]],
 ) -> None:
+    """One card, one row per storm, the same rhythm as the rest of the chrome."""
+
     if not storms:
         return
 
+    chrome = _Chrome(ax)
     left, bottom, width, height = _typhoon_panel_geometry(len(storms))
     top = bottom + height
-    panel = FancyBboxPatch(
-        (left, bottom),
-        width,
-        height,
-        transform=ax.transAxes,
-        boxstyle="round,pad=0.007,rounding_size=0.017",
-        facecolor=GLASS_SURFACE,
-        edgecolor=GLASS_EDGE,
-        linewidth=0.85,
-        zorder=Z_FIXED_UI,
-    )
-    panel.set_gid("typhoon-status-panel")
-    panel.set_path_effects(_glass_path_effects(shadow_alpha=0.12))
-    ax.add_patch(panel)
-    ax.plot(
-        [left + 0.014, left + width - 0.014],
-        [top - 0.006, top - 0.006],
-        transform=ax.transAxes,
-        color=GLASS_HIGHLIGHT,
-        linewidth=0.75,
-        solid_capstyle="round",
-        zorder=Z_FIXED_UI_TEXT,
-    )
-    ax.text(
-        left + 0.016,
-        top - 0.023,
+    chrome.card(left, bottom, width, height, gid="typhoon-status-panel")
+    chrome.text(
+        left + 16.0,
+        top - 21.0,
         "태풍 현황",
-        transform=ax.transAxes,
-        color=INK,
-        fontsize=8.1,
-        fontweight="bold",
-        ha="left",
-        va="center",
-        zorder=Z_FIXED_UI_TEXT,
+        size=TYPE_HEADING,
+        weight=WEIGHT_BOLD,
+        color=LABEL,
     )
-    ax.text(
-        left + width - 0.014,
-        top - 0.023,
+    chrome.text(
+        left + width - 16.0,
+        top - 21.0,
         f"{len(storms)}개 활동 중",
-        transform=ax.transAxes,
-        color=TYPHOON,
-        fontsize=5.6,
-        fontweight="semibold",
+        size=TYPE_CAPTION,
+        weight=WEIGHT_BOLD,
+        color=ALERT,
         ha="right",
-        va="center",
-        bbox={
-            "boxstyle": "round,pad=0.28,rounding_size=0.55",
-            "facecolor": "#FFF0F2D9",
-            "edgecolor": "#FFFFFFB8",
-            "linewidth": 0.45,
-        },
-        zorder=Z_FIXED_UI_TEXT,
     )
 
     for row_index, (storm_number, typhoon, point, color) in enumerate(storms):
-        row_top = top - TYPHOON_PANEL_HEADER_HEIGHT - row_index * TYPHOON_PANEL_ROW_HEIGHT
-        row_bottom = row_top - TYPHOON_PANEL_ROW_HEIGHT + 0.004
-        row_center = (row_top + row_bottom) / 2
+        row_top = top - PANEL_HEADER_HEIGHT - row_index * PANEL_ROW_HEIGHT
+        row_middle = row_top - PANEL_ROW_HEIGHT / 2.0 + 2.0
         row = FancyBboxPatch(
-            (left + 0.008, row_bottom),
-            width - 0.016,
-            TYPHOON_PANEL_ROW_HEIGHT - 0.008,
-            transform=ax.transAxes,
-            boxstyle="round,pad=0,rounding_size=0.010",
-            facecolor=mcolors.to_rgba(color, 0.055),
+            (chrome.x(left + 8.0), chrome.up(row_top - PANEL_ROW_HEIGHT + 4.0)),
+            chrome.s(width - 16.0),
+            chrome.s(PANEL_ROW_HEIGHT - 8.0),
+            transform=chrome.transform,
+            boxstyle=f"round,pad=0,rounding_size={chrome.s(RADIUS_SMALL)}",
+            mutation_aspect=1.0,
+            facecolor=mcolors.to_rgba(color, 0.07),
             edgecolor="none",
+            clip_on=False,
             zorder=Z_FIXED_UI,
         )
         row.set_gid(f"typhoon-panel-row-{storm_number}")
         ax.add_patch(row)
 
-        number_marker = ax.scatter(
-            [left + 0.027],
-            [row_center],
-            s=128,
+        marker = ax.scatter(
+            [chrome.x(left + 26.0)],
+            [chrome.up(row_middle)],
+            s=150 * chrome.scale ** 2,
             c=color,
-            edgecolors=SURFACE,
-            linewidths=1.1,
-            transform=ax.transAxes,
+            edgecolors="none",
+            transform=chrome.transform,
+            clip_on=False,
             zorder=Z_FIXED_UI_TEXT,
         )
-        number_marker.set_gid(f"typhoon-panel-marker-{storm_number}")
-        panel_number = ax.text(
-            left + 0.027,
-            row_center,
+        marker.set_gid(f"typhoon-panel-marker-{storm_number}")
+        chrome.text(
+            left + 26.0,
+            row_middle,
             str(storm_number),
-            transform=ax.transAxes,
+            size=TYPE_CAPTION,
+            weight=WEIGHT_BOLD,
             color=SURFACE,
-            fontsize=6.3,
-            fontweight="bold",
             ha="center",
-            va="center",
             zorder=Z_FIXED_UI_TEXT + 1,
+            gid=f"typhoon-panel-number-{storm_number}",
         )
-        panel_number.set_gid(f"typhoon-panel-number-{storm_number}")
 
-        current = typhoon.current or point
-        pressure = point.pressure_hpa if point.pressure_hpa is not None else current.pressure_hpa
-        wind = point.wind_speed_ms if point.wind_speed_ms is not None else current.wind_speed_ms
-        movement_point = point if point.move_direction or point.move_speed_kmh else current
-        vitals: list[str] = []
-        if pressure is not None:
-            vitals.append(f"{pressure:.0f} hPa")
-        if wind is not None:
-            vitals.append(f"{wind:.0f} m/s")
-        vitals_text = " · ".join(vitals) if vitals else "중심 정보 확인 중"
-        movement = (
-            _move_direction_ko(movement_point.move_direction)
-            if movement_point.move_direction
-            else "이동 정보 확인 중"
-        )
-        if movement_point.move_speed_kmh is not None:
-            movement = f"{movement} · {movement_point.move_speed_kmh:.0f} km/h"
-
-        ax.text(
-            left + 0.049,
-            row_center + 0.013,
+        vitals_text, movement = _storm_vitals(typhoon, point)
+        chrome.text(
+            left + 44.0,
+            row_middle + 9.0,
             _compact_label_value(typhoon.name or "이름 확인 중", 9),
-            transform=ax.transAxes,
-            color=INK,
-            fontsize=7.3,
-            fontweight="bold",
-            ha="left",
-            va="center",
-            zorder=Z_FIXED_UI_TEXT,
+            size=TYPE_BODY,
+            weight=WEIGHT_BOLD,
+            color=LABEL,
         )
-        ax.text(
-            left + width - 0.015,
-            row_center + 0.013,
-            _compact_label_value(typhoon.storm_id, 13),
-            transform=ax.transAxes,
-            color=MUTED,
-            fontsize=4.8,
-            fontweight="semibold",
+        chrome.text(
+            left + width - 16.0,
+            row_middle + 9.0,
+            _compact_label_value(typhoon.storm_id, 12),
+            size=TYPE_MICRO,
+            color=LABEL_TERTIARY,
             ha="right",
-            va="center",
-            zorder=Z_FIXED_UI_TEXT,
         )
-
-        ax.text(
-            left + 0.049,
-            row_center - 0.014,
+        chrome.text(
+            left + 44.0,
+            row_middle - 10.0,
             vitals_text,
-            transform=ax.transAxes,
-            color="#4E5968",
-            fontsize=5.4,
-            fontweight="semibold",
-            ha="left",
-            va="center",
-            zorder=Z_FIXED_UI_TEXT,
+            size=TYPE_CAPTION,
+            color=LABEL_SECONDARY,
         )
-        ax.text(
-            left + width - 0.015,
-            row_center - 0.014,
+        chrome.text(
+            left + width - 16.0,
+            row_middle - 10.0,
             movement,
-            transform=ax.transAxes,
-            color=MUTED,
-            fontsize=5.0,
-            fontweight="semibold",
+            size=TYPE_CAPTION,
+            color=LABEL_TERTIARY,
             ha="right",
-            va="center",
-            zorder=Z_FIXED_UI_TEXT,
         )
 
-    legend_y = bottom + TYPHOON_PANEL_BOTTOM_PADDING + TYPHOON_PANEL_FOOTER_HEIGHT / 2
-    ax.plot(
-        [left + 0.017, left + 0.044],
-        [legend_y, legend_y],
-        transform=ax.transAxes,
-        color="#64748B",
-        linewidth=1.7,
-        linestyle="--",
-        solid_capstyle="round",
-        zorder=Z_FIXED_UI_TEXT,
-    )
-    ax.text(
-        left + 0.050,
-        legend_y,
-        "제공 경로",
-        transform=ax.transAxes,
-        color=MUTED,
-        fontsize=5.1,
-        fontweight="semibold",
-        ha="left",
-        va="center",
-        zorder=Z_FIXED_UI_TEXT,
-    )
-    ax.plot(
-        [left + 0.119, left + 0.146],
-        [legend_y, legend_y],
-        transform=ax.transAxes,
-        color="#64748B",
-        linewidth=1.6,
-        linestyle=":",
-        solid_capstyle="round",
-        zorder=Z_FIXED_UI_TEXT,
-    )
-    ax.text(
-        left + 0.152,
-        legend_y,
-        "GFS 모델",
-        transform=ax.transAxes,
-        color=MUTED,
-        fontsize=5.1,
-        fontweight="semibold",
-        ha="left",
-        va="center",
-        zorder=Z_FIXED_UI_TEXT,
-    )
-
-
-def _draw_typhoon_route_legend(ax: plt.Axes) -> None:
-    left, bottom, width, height = 0.758, 0.048, 0.224, 0.046
-    panel = FancyBboxPatch(
-        (left, bottom),
-        width,
-        height,
-        transform=ax.transAxes,
-        boxstyle="round,pad=0.006,rounding_size=0.014",
-        facecolor=GLASS_SURFACE,
-        edgecolor=GLASS_EDGE,
-        linewidth=0.8,
-        zorder=Z_FIXED_UI,
-    )
-    panel.set_path_effects(_glass_path_effects(shadow_alpha=0.10))
-    ax.add_patch(panel)
-    ax.plot(
-        [left + 0.014, left + width - 0.014],
-        [bottom + height - 0.005, bottom + height - 0.005],
-        transform=ax.transAxes,
-        color=GLASS_HIGHLIGHT,
-        linewidth=0.65,
-        solid_capstyle="round",
-        zorder=Z_FIXED_UI_TEXT,
-    )
-
-    route_y = bottom + height / 2
-    ax.plot(
-        [0.773, 0.805],
-        [route_y, route_y],
-        transform=ax.transAxes,
-        color="#64748B",
-        linewidth=2.3,
-        linestyle="--",
-        zorder=Z_FIXED_UI,
-        path_effects=[
-            path_effects.Stroke(linewidth=4.0, foreground="#FFFFFFD9"),
-            path_effects.Normal(),
-        ],
-    )
-    ax.text(
-        0.811,
-        route_y,
-        "제공 경로",
-        transform=ax.transAxes,
-        color="#465466",
-        fontsize=5.8,
-        fontweight="semibold",
-        va="center",
-        zorder=Z_FIXED_UI_TEXT,
-    )
-    ax.plot(
-        [0.885, 0.915],
-        [route_y, route_y],
-        transform=ax.transAxes,
-        color="#64748B",
-        linewidth=2.0,
-        linestyle=":",
-        zorder=Z_FIXED_UI,
-        path_effects=[
-            path_effects.Stroke(linewidth=3.7, foreground="#FFFFFFD9"),
-            path_effects.Normal(),
-        ],
-    )
-    ax.text(
-        0.921,
-        route_y,
-        "GFS 모델",
-        transform=ax.transAxes,
-        color="#465466",
-        fontsize=5.8,
-        fontweight="semibold",
-        va="center",
-        zorder=Z_FIXED_UI_TEXT,
-    )
+    footer_middle = bottom + PANEL_PADDING + PANEL_FOOTER_HEIGHT / 2.0
+    chrome.rule(left + 12.0, bottom + PANEL_PADDING + PANEL_FOOTER_HEIGHT, width - 24.0)
+    for line_left, style, caption, caption_left in (
+        (left + 16.0, (0, (5, 3)), "실황 · 예보", left + 48.0),
+        (left + 124.0, (0, (1, 2.4)), "GFS 모델", left + 156.0),
+    ):
+        ax.plot(
+            [chrome.x(line_left), chrome.x(line_left + 24.0)],
+            [chrome.up(footer_middle), chrome.up(footer_middle)],
+            transform=chrome.transform,
+            color=LABEL_TERTIARY,
+            linewidth=1.6,
+            linestyle=style,
+            solid_capstyle="round",
+            dash_capstyle="round",
+            clip_on=False,
+            zorder=Z_FIXED_UI_TEXT,
+        )
+        chrome.text(
+            caption_left,
+            footer_middle,
+            caption,
+            size=TYPE_MICRO,
+            color=LABEL_TERTIARY,
+        )
 
 
 def _draw_typhoons(
@@ -1451,7 +1594,7 @@ def _draw_typhoons(
             history,
             color=storm_color,
             linestyle="-",
-            linewidth=2.7,
+            linewidth=2.3,
             gid=f"typhoon-track-{storm_number}-history",
             zorder=21,
         )
@@ -1459,8 +1602,8 @@ def _draw_typhoons(
             ax,
             forecast,
             color=storm_color,
-            linestyle="--",
-            linewidth=2.8,
+            linestyle=(0, (5, 3)),
+            linewidth=2.3,
             marker="o",
             gid=f"typhoon-track-{storm_number}-provided",
             zorder=22,
@@ -1474,10 +1617,10 @@ def _draw_typhoons(
             ax,
             model_points,
             color=storm_color,
-            linestyle=":",
-            linewidth=2.1,
+            linestyle=(0, (1, 2.4)),
+            linewidth=1.8,
             marker="s" if len(model_points) < 14 else None,
-            alpha=0.68,
+            alpha=0.6,
             gid=f"typhoon-track-{storm_number}-gfs",
             zorder=20,
         )
@@ -1499,107 +1642,177 @@ def _draw_typhoons(
 
 
 def _draw_rain_legend(ax: plt.Axes) -> None:
-    left, bottom, width, height = 0.018, 0.034, 0.318, 0.084
-    card = FancyBboxPatch(
-        (left, bottom),
-        width,
-        height,
-        transform=ax.transAxes,
-        boxstyle="round,pad=0.008,rounding_size=0.015",
-        facecolor=GLASS_SURFACE,
-        edgecolor=GLASS_EDGE,
-        linewidth=0.85,
-        zorder=Z_FIXED_UI,
-    )
-    card.set_path_effects(_glass_path_effects(shadow_alpha=0.11))
-    ax.add_patch(card)
+    """The legend shows the same eight bands the map uses — no simplification.
 
-    ax.plot(
-        [left + 0.014, left + width - 0.014],
-        [bottom + height - 0.006, bottom + height - 0.006],
-        transform=ax.transAxes,
-        color=GLASS_HIGHLIGHT,
-        linewidth=0.7,
-        solid_capstyle="round",
-        zorder=Z_FIXED_UI_TEXT,
-    )
+    The previous version reduced eight painted bands to three word swatches,
+    so a reader could not tell 10 mm from 80 mm. Here the ramp is continuous
+    and every band boundary is labelled.
+    """
 
-    rain_icon_x = left + 0.018
-    rain_icon_y = bottom + height - 0.022
-    for offset in (-0.006, 0.0, 0.006):
-        ax.plot(
-            [rain_icon_x + offset + 0.002, rain_icon_x + offset - 0.002],
-            [rain_icon_y + 0.005, rain_icon_y - 0.003],
-            transform=ax.transAxes,
-            color=PRIMARY,
-            linewidth=1.35,
-            solid_capstyle="round",
-            zorder=Z_FIXED_UI_TEXT,
-        )
-    ax.text(
-        left + 0.036,
-        rain_icon_y,
-        "3시간 예상 강수량",
-        transform=ax.transAxes,
-        color=INK,
-        fontsize=7.6,
-        fontweight="semibold",
-        va="center",
-        zorder=Z_FIXED_UI_TEXT,
+    chrome = _Chrome(ax)
+    top = LEGEND_BOTTOM + LEGEND_HEIGHT
+    chrome.card(COLUMN_LEFT, LEGEND_BOTTOM, COLUMN_WIDTH, LEGEND_HEIGHT)
+    chrome.text(
+        COLUMN_LEFT + LEGEND_BAR_INSET,
+        top - 18.0,
+        "3시간 강수량",
+        size=TYPE_BODY,
+        weight=WEIGHT_BOLD,
+        color=LABEL,
     )
-    ax.text(
-        left + width - 0.014,
-        rain_icon_y,
-        "mm 기준",
-        transform=ax.transAxes,
-        color=MUTED,
-        fontsize=5.3,
-        fontweight="semibold",
+    chrome.text(
+        COLUMN_LEFT + COLUMN_WIDTH - LEGEND_BAR_INSET,
+        top - 18.0,
+        "mm",
+        size=TYPE_MICRO,
+        color=LABEL_TERTIARY,
         ha="right",
-        va="center",
-        zorder=Z_FIXED_UI_TEXT,
     )
 
-    for center_x, color, label, amount in (
-        (left + 0.057, PRECIP_COLORS[1], "약한 비", "0.2–3 mm"),
-        (left + 0.159, PRECIP_COLORS[4], "보통 비", "3–10 mm"),
-        (left + 0.261, PRECIP_COLORS[6], "강한 비", "10 mm+"),
-    ):
-        swatch = FancyBboxPatch(
-            (center_x - 0.018, bottom + 0.034),
-            0.036,
-            0.011,
-            transform=ax.transAxes,
-            boxstyle="round,pad=0,rounding_size=0.0055",
-            facecolor=color,
-            edgecolor="#FFFFFF99",
-            linewidth=0.45,
-            zorder=Z_FIXED_UI_TEXT,
+    bar_left = COLUMN_LEFT + LEGEND_BAR_INSET
+    bar_width = COLUMN_WIDTH - LEGEND_BAR_INSET * 2
+    bar_bottom = top - 32.0 - LEGEND_BAR_HEIGHT
+    segment = bar_width / len(PRECIP_COLORS)
+    for index, color in enumerate(PRECIP_COLORS):
+        ax.add_patch(
+            Rectangle(
+                (
+                    chrome.x(bar_left + index * segment),
+                    chrome.up(bar_bottom),
+                ),
+                chrome.s(segment) + 0.5,
+                chrome.s(LEGEND_BAR_HEIGHT),
+                transform=chrome.transform,
+                facecolor=color,
+                edgecolor="none",
+                clip_on=False,
+                zorder=Z_FIXED_UI_TEXT,
+            )
         )
-        ax.add_patch(swatch)
-        ax.text(
-            center_x,
-            bottom + 0.024,
-            label,
-            transform=ax.transAxes,
-            color="#4E5968",
-            fontsize=6.2,
-            fontweight="semibold",
+    # Two passes over the same rounded rectangle: the thick surface-colored
+    # stroke clips the square band ends into a capsule, the hairline then
+    # gives the lightest band an edge it would otherwise lack on white.
+    for width, color in ((2.4, CARD_FILL), (HAIRLINE, CARD_HAIRLINE)):
+        ax.add_patch(
+            FancyBboxPatch(
+                (chrome.x(bar_left), chrome.up(bar_bottom)),
+                chrome.s(bar_width),
+                chrome.s(LEGEND_BAR_HEIGHT),
+                transform=chrome.transform,
+                boxstyle=f"round,pad=0,rounding_size={chrome.s(LEGEND_BAR_HEIGHT / 2)}",
+                mutation_aspect=1.0,
+                facecolor="none",
+                edgecolor=color,
+                linewidth=width,
+                clip_on=False,
+                zorder=Z_FIXED_UI_TEXT + 1,
+            )
+        )
+
+    for index, level in enumerate(PRECIP_LEVELS):
+        chrome.text(
+            bar_left + index * segment,
+            bar_bottom - 10.0,
+            f"{level:g}",
+            size=TYPE_MICRO - 0.4,
+            color=LABEL_TERTIARY,
             ha="center",
-            va="center",
+        )
+
+
+def _draw_timestamp(
+    ax: plt.Axes,
+    valid_time_cst: datetime,
+    forecast_hour: int,
+    *,
+    demo: bool,
+) -> None:
+    """The only thing at the top of the frame: when this frame is valid.
+
+    It carries no card. Bare type on the empty north western land reads
+    cleaner at this size than a box would, and a soft halo keeps it legible
+    on the rare frame where rain reaches the corner.
+    """
+
+    chrome = _Chrome(ax)
+    chrome.text(
+        MARGIN,
+        chrome.from_top(STAMP_DATE_TOP),
+        _korean_datetime(valid_time_cst),
+        size=TYPE_STAMP,
+        weight=WEIGHT_BOLD,
+        color=LABEL,
+        va="top",
+        zorder=Z_HEADER,
+        halo=True,
+    )
+    chrome.text(
+        MARGIN + 1.0,
+        chrome.from_top(STAMP_OFFSET_TOP),
+        _forecast_label(forecast_hour),
+        size=TYPE_STAMP_SUB,
+        weight=WEIGHT_BOLD,
+        color=ACCENT,
+        va="top",
+        zorder=Z_HEADER,
+        halo=True,
+    )
+    if demo:
+        badge = chrome.text(
+            MARGIN + 2.0,
+            chrome.from_top(STAMP_BADGE_TOP),
+            "미리보기",
+            size=TYPE_BODY,
+            weight=WEIGHT_BOLD,
+            color=ACCENT_DEEP,
+            va="top",
+            zorder=Z_HEADER,
+        )
+        badge.set_bbox(
+            {
+                "boxstyle": "round,pad=0.42,rounding_size=0.9",
+                "facecolor": CARD_FILL_TINT,
+                "edgecolor": CARD_HAIRLINE,
+                "linewidth": HAIRLINE,
+            }
+        )
+
+
+def _draw_footer(ax: plt.Axes, progress: float) -> None:
+    chrome = _Chrome(ax)
+    chrome.text(
+        MARGIN,
+        ATTRIBUTION_BOTTOM,
+        "Weather model: NOAA/NCEP GFS  ·  Weather & Typhoon data: QWeather",
+        size=TYPE_MICRO - 0.6,
+        color=LABEL_TERTIARY,
+        halo=True,
+    )
+    # A full-bleed scrubber reads as elapsed time without adding one more box.
+    ax.add_patch(
+        Rectangle(
+            (0.0, 0.0),
+            chrome.width,
+            chrome.s(PROGRESS_HEIGHT),
+            transform=chrome.transform,
+            facecolor="#FFFFFFB3",
+            edgecolor="none",
+            clip_on=False,
+            zorder=Z_FIXED_UI,
+        )
+    )
+    ax.add_patch(
+        Rectangle(
+            (0.0, 0.0),
+            max(chrome.s(2.0), chrome.width * progress),
+            chrome.s(PROGRESS_HEIGHT),
+            transform=chrome.transform,
+            facecolor=ACCENT,
+            edgecolor="none",
+            clip_on=False,
             zorder=Z_FIXED_UI_TEXT,
         )
-        ax.text(
-            center_x,
-            bottom + 0.010,
-            amount,
-            transform=ax.transAxes,
-            color=MUTED,
-            fontsize=5.3,
-            ha="center",
-            va="center",
-            zorder=Z_FIXED_UI_TEXT,
-        )
+    )
 
 
 def _forecast_label(hours: int) -> str:
@@ -1615,46 +1828,36 @@ def _forecast_label(hours: int) -> str:
 
 def _korean_datetime(value: datetime) -> str:
     weekdays = ("월", "화", "수", "목", "금", "토", "일")
-    return f"{value.month}월 {value.day}일 {weekdays[value.weekday()]}요일  {value:%H:%M}"
+    return f"{value.month}월 {value.day}일 ({weekdays[value.weekday()]}) {value:%H:%M}"
 
 
-def render_frame(
-    frame: FrameData,
-    frame_index: int,
-    frame_count: int,
-    gfs_run: str,
-    city_weather: dict[str, CityWeather],
-    typhoons: list[Typhoon],
-    model_tracks: dict[str, list[ModelTrackPoint]],
-    settings: Settings,
-    *,
-    demo: bool = False,
-) -> Image.Image:
-    fig = plt.figure(figsize=(10, 6.25), dpi=100, facecolor=OCEAN)
-    ax = fig.add_axes([0, 0, 1, 1], projection=ccrs.PlateCarree())
-    ax.set_extent(settings.bounds, crs=ccrs.PlateCarree())
-    # The viewport and canvas ratios differ only slightly. Filling the canvas
-    # avoids detached header/footer bands and keeps every label inside the map.
-    ax.set_aspect("auto")
+def _draw_basemap(ax: plt.Axes) -> None:
+    """Value, not outline weight, is what separates the subject from the rest.
+
+    Foreign land is one step darker than the sea, China and Taiwan one step
+    brighter than anything else. That reads instantly at GIF scale and leaves
+    saturated color free for the weather.
+    """
+
     ax.set_facecolor(OCEAN)
     ax.add_feature(cfeature.OCEAN.with_scale("110m"), facecolor=OCEAN, zorder=0)
     ax.add_feature(cfeature.LAND.with_scale("110m"), facecolor=LAND, zorder=1)
     ax.add_feature(
         cfeature.LAKES.with_scale("110m"),
         facecolor=OCEAN,
-        edgecolor="#C9DCE4",
+        edgecolor=COASTLINE,
         linewidth=0.3,
         zorder=3,
     )
     ax.add_feature(
         cfeature.BORDERS.with_scale("110m"),
-        edgecolor="#D2D8DE",
+        edgecolor=BORDERLINE,
         linewidth=0.45,
         zorder=4,
     )
     ax.add_feature(
         cfeature.COASTLINE.with_scale("110m"),
-        edgecolor="#B9C3CC",
+        edgecolor=COASTLINE,
         linewidth=0.45,
         zorder=4,
     )
@@ -1665,18 +1868,18 @@ def render_frame(
         ax.add_geometries(
             china,
             crs=ccrs.PlateCarree(),
-            facecolor="#FCFDFE",
-            edgecolor=PRIMARY,
-            linewidth=1.4,
+            facecolor=LAND_SUBJECT,
+            edgecolor=SUBJECT_LINE,
+            linewidth=1.0,
             zorder=2,
         )
     if taiwan:
         ax.add_geometries(
             taiwan,
             crs=ccrs.PlateCarree(),
-            facecolor="#F4F1FF",
+            facecolor=LAND_SUBJECT,
             edgecolor=TAIWAN,
-            linewidth=1.25,
+            linewidth=1.0,
             zorder=2,
         )
 
@@ -1686,11 +1889,13 @@ def render_frame(
             provinces,
             crs=ccrs.PlateCarree(),
             facecolor="none",
-            edgecolor="#D7DEE5",
-            linewidth=0.32,
+            edgecolor="#DFE4EA",
+            linewidth=0.3,
             zorder=3,
         )
 
+
+def _draw_weather_layers(ax: plt.Axes, frame: FrameData) -> None:
     lon_grid, lat_grid = np.meshgrid(frame.longitudes, frame.latitudes)
     precipitation = np.ma.masked_less(frame.precipitation_mm, PRECIP_LEVELS[0])
     ax.contourf(
@@ -1701,7 +1906,7 @@ def render_frame(
         cmap=PRECIP_CMAP,
         norm=PRECIP_NORM,
         extend="max",
-        alpha=0.82,
+        alpha=0.88,
         antialiased=True,
         transform=ccrs.PlateCarree(),
         zorder=5,
@@ -1716,22 +1921,24 @@ def render_frame(
             lat_grid,
             frame.pressure_hpa,
             levels=pressure_levels,
-            colors="#4E5968",
-            linewidths=0.55,
-            alpha=0.14,
+            colors=LABEL_SECONDARY,
+            linewidths=0.5,
+            alpha=0.10,
             transform=ccrs.PlateCarree(),
             zorder=7,
         )
 
-    stride = max(1, round(len(frame.longitudes) / 15))
+    # Wind is texture, not a readable value here, so it stays below the
+    # threshold where it would compete with the rain bands.
+    stride = max(1, round(len(frame.longitudes) / 13))
     ax.quiver(
         lon_grid[::stride, ::stride],
         lat_grid[::stride, ::stride],
         frame.u10_ms[::stride, ::stride],
         frame.v10_ms[::stride, ::stride],
-        color="#4E5968",
-        alpha=0.16,
-        width=0.00145,
+        color=LABEL_SECONDARY,
+        alpha=0.13,
+        width=0.0013,
         headwidth=3.0,
         headlength=3.8,
         headaxislength=3.2,
@@ -1740,14 +1947,15 @@ def render_frame(
         zorder=8,
     )
 
-    # Repaint the national outline above the rain so China remains instantly legible.
+    china = _china_geometries()
+    taiwan = _taiwan_geometries()
     if china:
         ax.add_geometries(
             china,
             crs=ccrs.PlateCarree(),
             facecolor="none",
-            edgecolor=PRIMARY,
-            linewidth=1.65,
+            edgecolor=SUBJECT_LINE,
+            linewidth=1.1,
             zorder=12,
         )
     if taiwan:
@@ -1756,36 +1964,50 @@ def render_frame(
             crs=ccrs.PlateCarree(),
             facecolor="none",
             edgecolor=TAIWAN,
-            linewidth=1.5,
+            linewidth=1.1,
             zorder=12,
         )
-
     ax.text(
-        0.39,
-        0.56,
-        "중국",
-        transform=ax.transAxes,
-        color=PRIMARY,
-        fontsize=40,
-        fontweight="bold",
-        alpha=0.075,
-        ha="center",
-        va="center",
-        zorder=9,
-    )
-    ax.text(
-        123.2,
-        27.0,
+        TAIWAN_LABEL_LONLAT[0],
+        TAIWAN_LABEL_LONLAT[1],
         "대만",
         transform=ccrs.PlateCarree(),
         color=TAIWAN,
-        fontsize=8.5,
-        fontweight="bold",
-        alpha=0.55,
+        fontsize=TYPE_CAPTION,
+        fontweight=WEIGHT_BOLD,
+        alpha=0.7,
         ha="left",
         va="center",
         zorder=13,
+        path_effects=_halo(2.0),
     )
+
+
+def render_frame(
+    frame: FrameData,
+    frame_index: int,
+    frame_count: int,
+    gfs_run: str,
+    city_weather: dict[str, CityWeather],
+    typhoons: list[Typhoon],
+    model_tracks: dict[str, list[ModelTrackPoint]],
+    settings: Settings,
+    *,
+    demo: bool = False,
+) -> Image.Image:
+    fig = plt.figure(
+        figsize=(CANVAS_WIDTH_PX / 100.0, canvas_height(settings) / 100.0),
+        dpi=100,
+        facecolor=OCEAN,
+    )
+    ax = fig.add_axes([0, 0, 1, 1], projection=ccrs.PlateCarree())
+    ax.set_extent(settings.bounds, crs=ccrs.PlateCarree())
+    # The viewport and canvas ratios differ only slightly. Filling the canvas
+    # avoids detached header/footer bands and keeps every label inside the map.
+    ax.set_aspect("auto")
+
+    _draw_basemap(ax)
+    _draw_weather_layers(ax, frame)
 
     anchors = _city_label_anchors(ax, city_weather)
     active_typhoon_count = min(
@@ -1802,9 +2024,8 @@ def render_frame(
         for anchor in anchors.values()
     )
     # Resolve the city layout without any storm data. The same inputs produce
-    # the same card coordinates in every frame, so cards never jump as a
-    # typhoon passes. Active-storm information stays in the reserved west-side
-    # panel, while only the numbered eyes move across the map.
+    # the same capsule coordinates in every frame, so nothing jumps as a
+    # typhoon passes; only the numbered eyes move across the map.
     occupied_boxes = _draw_city_cards(
         ax,
         frame,
@@ -1820,203 +2041,13 @@ def render_frame(
         model_tracks,
         occupied_boxes,
     )
+
     _draw_rain_legend(ax)
+    cst = frame.valid_time.astimezone(timezone(timedelta(hours=8)))
+    _draw_timestamp(ax, cst, frame.forecast_hour, demo=demo)
+    _draw_footer(ax, (frame_index + 1) / frame_count)
 
     ax.spines["geo"].set_edgecolor("none")
-
-    cst = frame.valid_time.astimezone(timezone(timedelta(hours=8)))
-    title_effects = [
-        path_effects.Stroke(linewidth=2.8, foreground="#FFFFFFE8"),
-        path_effects.Normal(),
-    ]
-    ax.text(
-        0.026,
-        0.952,
-        "중여커 날씨",
-        transform=ax.transAxes,
-        color=INK,
-        fontsize=28.0,
-        fontweight="bold",
-        ha="left",
-        va="center",
-        path_effects=title_effects,
-        zorder=Z_HEADER,
-    )
-    ax.text(
-        0.028,
-        0.899,
-        "태풍 · 비 · 도시별 온도",
-        transform=ax.transAxes,
-        color="#4E5968",
-        fontsize=9.0,
-        fontweight="bold",
-        ha="left",
-        va="center",
-        path_effects=[
-            path_effects.Stroke(linewidth=1.9, foreground="#FFFFFFE8"),
-            path_effects.Normal(),
-        ],
-        zorder=Z_HEADER,
-    )
-    time_card = FancyBboxPatch(
-        (0.725, 0.925),
-        0.255,
-        0.060,
-        transform=ax.transAxes,
-        boxstyle="round,pad=0,rounding_size=0.014",
-        facecolor=GLASS_SURFACE_BLUE,
-        edgecolor=GLASS_EDGE,
-        linewidth=0.85,
-        zorder=Z_TIME,
-    )
-    time_card.set_path_effects(_glass_path_effects(shadow_alpha=0.12))
-    ax.add_patch(time_card)
-    ax.plot(
-        [0.741, 0.964],
-        [0.978, 0.978],
-        transform=ax.transAxes,
-        color=GLASS_HIGHLIGHT,
-        linewidth=0.75,
-        solid_capstyle="round",
-        zorder=Z_TIME + 1,
-    )
-    ax.plot(
-        [0.883, 0.883],
-        [0.937, 0.973],
-        transform=ax.transAxes,
-        color=GLASS_SEPARATOR,
-        linewidth=0.8,
-        zorder=Z_TIME + 1,
-    )
-
-    # Small vector glyphs add finish without relying on platform-specific emoji
-    # rendering, which keeps all GIF frames identical on Linux and macOS.
-    calendar = FancyBboxPatch(
-        (0.739, 0.946),
-        0.014,
-        0.018,
-        transform=ax.transAxes,
-        boxstyle="round,pad=0,rounding_size=0.0025",
-        facecolor="#FFFFFF73",
-        edgecolor=PRIMARY,
-        linewidth=0.65,
-        zorder=Z_TIME + 1,
-    )
-    ax.add_patch(calendar)
-    ax.plot(
-        [0.7405, 0.7515],
-        [0.958, 0.958],
-        transform=ax.transAxes,
-        color=PRIMARY,
-        linewidth=0.55,
-        zorder=Z_TIME + 2,
-    )
-    clock = Circle(
-        (0.9005, 0.955),
-        radius=0.008,
-        transform=ax.transAxes,
-        facecolor="#FFFFFF73",
-        edgecolor=PRIMARY,
-        linewidth=0.65,
-        zorder=Z_TIME + 1,
-    )
-    ax.add_patch(clock)
-    ax.plot(
-        [0.9005, 0.9005, 0.9040],
-        [0.960, 0.955, 0.9525],
-        transform=ax.transAxes,
-        color=PRIMARY,
-        linewidth=0.55,
-        solid_capstyle="round",
-        zorder=Z_TIME + 2,
-    )
-    ax.text(
-        0.758,
-        0.955,
-        _korean_datetime(cst),
-        transform=ax.transAxes,
-        color=PRIMARY_DARK,
-        fontsize=7.8,
-        fontweight="semibold",
-        ha="left",
-        va="center",
-        zorder=Z_TIME + 1,
-    )
-    ax.text(
-        0.943,
-        0.955,
-        _forecast_label(frame.forecast_hour),
-        transform=ax.transAxes,
-        color=PRIMARY_DARK,
-        fontsize=7.8,
-        fontweight="semibold",
-        ha="center",
-        va="center",
-        zorder=Z_TIME + 1,
-    )
-    if demo:
-        preview_badge = ax.text(
-            0.226,
-            0.952,
-            "미리보기",
-            transform=ax.transAxes,
-            color=PRIMARY_DARK,
-            fontsize=5.7,
-            fontweight="semibold",
-            ha="center",
-            va="center",
-            bbox={
-                "boxstyle": "round,pad=0.34,rounding_size=0.7",
-                "facecolor": GLASS_SURFACE_BLUE,
-                "edgecolor": GLASS_EDGE,
-                "linewidth": 0.65,
-            },
-            zorder=Z_TIME,
-        )
-        preview_patch = preview_badge.get_bbox_patch()
-        if preview_patch is not None:
-            preview_patch.set_path_effects(_glass_path_effects(shadow_alpha=0.09))
-
-    ax.text(
-        0.978,
-        0.041,
-        "Weather model: NOAA/NCEP GFS  ·  Weather & Typhoon data: QWeather",
-        transform=ax.transAxes,
-        color="#6B7684",
-        fontsize=4.8,
-        ha="right",
-        va="center",
-        path_effects=[
-            path_effects.Stroke(linewidth=2.1, foreground="#FFFFFFEE"),
-            path_effects.Normal(),
-        ],
-        zorder=Z_FIXED_UI_TEXT,
-    )
-
-    progress = (frame_index + 1) / frame_count
-    progress_track = FancyBboxPatch(
-        (0.018, 0.014),
-        0.964,
-        0.007,
-        transform=ax.transAxes,
-        boxstyle="round,pad=0,rounding_size=0.003",
-        facecolor="#FFFFFF70",
-        edgecolor="#FFFFFF9C",
-        linewidth=0.35,
-        zorder=Z_FIXED_UI,
-    )
-    progress_value = FancyBboxPatch(
-        (0.018, 0.014),
-        max(0.002, 0.964 * progress),
-        0.007,
-        transform=ax.transAxes,
-        boxstyle="round,pad=0,rounding_size=0.003",
-        facecolor=PRIMARY,
-        edgecolor="none",
-        zorder=Z_FIXED_UI_TEXT,
-    )
-    ax.add_patch(progress_track)
-    ax.add_patch(progress_value)
 
     fig.canvas.draw()
     image = Image.frombuffer(
@@ -2044,26 +2075,27 @@ def _global_palette(frames: list[Image.Image], colors: int) -> Image.Image:
         atlas.paste(thumbnail, (0, index * 125))
 
     reserved_hex = [
-        INK,
-        "#4E5968",
-        MUTED,
-        SUBTLE,
-        PRIMARY,
-        PRIMARY_DARK,
-        TYPHOON,
-        "#E54856",
+        LABEL,
+        LABEL_SECONDARY,
+        LABEL_TERTIARY,
+        ACCENT,
+        ACCENT_DEEP,
+        ALERT,
         WARM,
+        COOL,
         TAIWAN,
         SURFACE,
-        LAND,
         OCEAN,
-        "#A8B2BD",
-        "#FFB13B",
-        "#DCE2E8",
-        "#6B7684",
-        "#E8F3FF",
-        "#FFF1C2",
-        "#7C4D00",
+        LAND,
+        LAND_SUBJECT,
+        COASTLINE,
+        BORDERLINE,
+        SUBJECT_LINE,
+        SEPARATOR,
+        CARD_HAIRLINE,
+        ICON_CLOUD,
+        ICON_SUN,
+        *STORM_COLORS,
         *PRECIP_COLORS,
     ]
     reserved = [

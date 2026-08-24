@@ -58,7 +58,7 @@ export default async function Home() {
             src={asset ? "/weather/china.gif" : "/sample/china-weather-sample.gif"}
             alt="태풍, 비, 도시별 온도를 보여주는 중국·대만 7일 날씨 지도"
             width={1000}
-            height={625}
+            height={618}
             unoptimized
             priority
           />

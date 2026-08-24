@@ -7,6 +7,8 @@ from weather_pipeline.demo import build_demo_data
 from weather_pipeline.model_track import derive_all_model_tracks
 from weather_pipeline.models import StormPoint, Typhoon
 from weather_pipeline.render import (
+    CANVAS_HEIGHT_PX,
+    CANVAS_WIDTH_PX,
     CITY_CARD_HEIGHT_POINTS,
     CITY_CARD_WIDTH_POINTS,
     CITY_NAME_FONT_SIZE,
@@ -29,7 +31,7 @@ def test_city_labels_and_typhoon_panel_stay_fixed() -> None:
     reference_panel_rectangle = None
 
     for frame_index, frame in enumerate(frames):
-        figure = plt.figure(figsize=(10, 6.25), dpi=100)
+        figure = plt.figure(figsize=(CANVAS_WIDTH_PX / 100, CANVAS_HEIGHT_PX / 100), dpi=100)
         axis = figure.add_axes([0, 0, 1, 1], projection=ccrs.PlateCarree())
         axis.set_extent(settings.bounds, crs=ccrs.PlateCarree())
         axis.set_aspect("auto")
@@ -83,8 +85,8 @@ def test_city_labels_and_typhoon_panel_stay_fixed() -> None:
         for index, rectangle in enumerate(city_rectangles):
             assert rectangle[0] >= 6.0
             assert rectangle[1] >= 6.0
-            assert rectangle[2] <= 994.0
-            assert rectangle[3] <= 619.0
+            assert rectangle[2] <= CANVAS_WIDTH_PX - 6.0
+            assert rectangle[3] <= CANVAS_HEIGHT_PX - 6.0
             assert not any(
                 _rectangles_overlap(rectangle, other)
                 for other in city_occupied[:city_start]
@@ -158,7 +160,7 @@ def test_two_typhoons_use_matching_numbers_and_colors_without_leader_cards() -> 
         )
     )
 
-    figure = plt.figure(figsize=(10, 6.25), dpi=100)
+    figure = plt.figure(figsize=(CANVAS_WIDTH_PX / 100, CANVAS_HEIGHT_PX / 100), dpi=100)
     axis = figure.add_axes([0, 0, 1, 1], projection=ccrs.PlateCarree())
     settings = Settings()
     axis.set_extent(settings.bounds, crs=ccrs.PlateCarree())
@@ -210,7 +212,7 @@ def test_city_layout_reservation_does_not_change_with_typhoon_count() -> None:
     layouts = []
 
     for typhoon_count in (0, 1, 2, 3):
-        figure = plt.figure(figsize=(10, 6.25), dpi=100)
+        figure = plt.figure(figsize=(CANVAS_WIDTH_PX / 100, CANVAS_HEIGHT_PX / 100), dpi=100)
         axis = figure.add_axes([0, 0, 1, 1], projection=ccrs.PlateCarree())
         axis.set_extent(settings.bounds, crs=ccrs.PlateCarree())
         axis.set_aspect("auto")

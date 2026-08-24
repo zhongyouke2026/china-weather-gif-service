@@ -24,11 +24,14 @@ def _path(name: str, default: str) -> Path:
 
 @dataclass(frozen=True)
 class Settings:
-    # China-focused viewport with a small border/nearshore margin.
+    # China-focused viewport. The top edge is cropped at 50N: everything above
+    # it was empty Mongolia and Russia plus a narrow wedge of far north east
+    # China with no cities in it — Harbin, the northernmost city on the map,
+    # sits at 45.8N and keeps a comfortable margin.
     left_lon: float = 72.0
     right_lon: float = 136.0
     bottom_lat: float = 17.0
-    top_lat: float = 55.0
+    top_lat: float = 50.0
     max_forecast_hour: int = _integer("WEATHER_MAX_FORECAST_HOUR", 168)
     frame_step_hours: int = _integer("WEATHER_FRAME_STEP_HOURS", 3)
     download_workers: int = _integer("WEATHER_DOWNLOAD_WORKERS", 3)

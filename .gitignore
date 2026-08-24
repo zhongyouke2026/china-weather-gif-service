@@ -15,3 +15,5 @@ artifacts/
 coverage/
 *.tsbuildinfo
 *.egg-info/
+.vercel
+.env*

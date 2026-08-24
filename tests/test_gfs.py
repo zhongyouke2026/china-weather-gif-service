@@ -21,7 +21,9 @@ def test_filter_request_only_selects_required_fields_and_bounds() -> None:
     assert params["leftlon"] == "72"
     assert params["rightlon"] == "136"
     assert params["bottomlat"] == "17"
-    assert params["toplat"] == "55"
+    # Matches Settings.top_lat: the viewport is cropped at 50N, so the filter
+    # request downloads that band and nothing above it.
+    assert params["toplat"] == "50"
     assert {key for key in params if key.startswith("var_")} == {
         "var_APCP",
         "var_PRMSL",
