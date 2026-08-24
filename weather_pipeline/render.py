@@ -1578,7 +1578,10 @@ def _draw_typhoons(
         (
             typhoon
             for typhoon in typhoons
-            if typhoon.is_active and typhoon.current
+            if typhoon.is_active
+            and typhoon.current
+            and typhoon.forecast
+            and typhoon.name != "热带低压"
         ),
         key=lambda typhoon: typhoon.storm_id,
     )[:3]
