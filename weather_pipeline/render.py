@@ -2013,14 +2013,11 @@ def render_frame(
     _draw_weather_layers(ax, frame)
 
     anchors = _city_label_anchors(ax, city_weather)
-    active_typhoon_count = min(
-        3,
-        sum(
-            1
-            for typhoon in typhoons
-            if typhoon.is_active and typhoon.current
-        ),
-    )
+    active_typhoons_for_count = [
+        t for t in typhoons 
+        if t.is_active and t.current and t.forecast and t.name != "热带低压"
+    ]
+    active_typhoon_count = min(3, len(active_typhoons_for_count))
     occupied_boxes = _label_reserved_boxes(ax, active_typhoon_count)
     occupied_boxes.extend(
         (anchor[0] - 5.0, anchor[1] - 5.0, anchor[0] + 5.0, anchor[1] + 5.0)
