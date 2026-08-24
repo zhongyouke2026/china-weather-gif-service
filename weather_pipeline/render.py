@@ -1263,15 +1263,15 @@ def _plot_track(
         line.set_gid(gid)
 
 
-def _storm_display_point(typhoon: Typhoon, valid_time: datetime) -> StormPoint:
+def _storm_display_point(typhoon: Typhoon, valid_time: datetime) -> StormPoint | None:
     current = typhoon.current
     if current is None:
         raise ValueError("Typhoon must have a current point")
     candidates = sorted([current, *typhoon.forecast], key=lambda point: point.time)
     if valid_time <= candidates[0].time or len(candidates) == 1:
         return candidates[0]
-    if valid_time >= candidates[-1].time:
-        return candidates[-1]
+    if valid_time > candidates[-1].time:
+        return None
 
     def interpolate_optional(
         left: float | None,
@@ -1590,6 +1590,10 @@ def _draw_typhoons(
         storm_number = storm_index + 1
         storm_color = STORM_COLORS[storm_index % len(STORM_COLORS)]
 
+        display_point = _storm_display_point(typhoon, frame.valid_time)
+        if display_point is None:
+            continue
+
         history = [*typhoon.history, typhoon.current]
         forecast = [typhoon.current, *typhoon.forecast]
         _plot_track(
@@ -1628,7 +1632,6 @@ def _draw_typhoons(
             zorder=20,
         )
 
-        display_point = _storm_display_point(typhoon, frame.valid_time)
         _draw_typhoon_swirl(
             ax,
             display_point,
