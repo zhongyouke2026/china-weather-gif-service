@@ -52,7 +52,7 @@ class SupabaseStore:
             timeout=30,
         )
         response.raise_for_status()
-        return True
+        return bool(response.json())
 
     def upload_file(
         self,
